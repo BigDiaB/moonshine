@@ -59,14 +59,9 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 		_ => state.last_pointer_activity = Some(std::time::Instant::now()),
 	}
 
-	// One-time X11 focus reset when HDR/gamescope WSI mode is active.
-	if state.override_surface.is_some() && state.x11_focus_needs_reset {
-		state.sync_x11_focus();
-	}
-
 	match event {
 		CompositorInputEvent::KeyDown { keycode } => {
-			tracing::trace!("Key down: {keycode}");
+			tracing::trace!(target: "input", "Key down: {keycode}");
 
 			if let Some(keyboard) = state.seat.get_keyboard() {
 				keyboard.input::<(), _>(
@@ -80,7 +75,7 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			}
 		},
 		CompositorInputEvent::KeyUp { keycode } => {
-			tracing::trace!("Key up: {keycode}");
+			tracing::trace!(target: "input", "Key up: {keycode}");
 
 			if let Some(keyboard) = state.seat.get_keyboard() {
 				keyboard.input::<(), _>(
@@ -99,7 +94,7 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			screen_width,
 			screen_height,
 		} => {
-			tracing::trace!("Mouse absolute: ({x}, {y}) screen: ({screen_width}x{screen_height})");
+			tracing::trace!(target: "input", "Mouse absolute: ({x}, {y}) screen: ({screen_width}x{screen_height})");
 			let output_size = state
 				.output
 				.current_mode()
@@ -121,7 +116,7 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			clamp_cursor(state);
 
 			let under = find_surface_under(state);
-			let pointer = state.seat.get_pointer().unwrap();
+			let pointer = state.seat.get_pointer().expect("pointer should exist");
 			pointer.motion(
 				state,
 				under,
@@ -134,10 +129,10 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			pointer.frame(state);
 		},
 		CompositorInputEvent::MouseMoveRelative { dx, dy } => {
-			tracing::trace!("Mouse relative: ({dx}, {dy})");
+			tracing::trace!(target: "input", "Mouse relative: ({dx}, {dy})");
 
 			let delta = Point::from((dx as f64, dy as f64));
-			let pointer = state.seat.get_pointer().unwrap();
+			let pointer = state.seat.get_pointer().expect("pointer should exist");
 
 			// Check for pointer constraints (lock/confine).
 			let mut pointer_locked = false;
@@ -185,9 +180,9 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			pointer.frame(state);
 		},
 		CompositorInputEvent::MouseButtonDown { button } => {
-			tracing::trace!("Mouse button down: {button:#x}");
+			tracing::trace!(target: "input", "Mouse button down: {button:#x}");
 
-			let pointer = state.seat.get_pointer().unwrap();
+			let pointer = state.seat.get_pointer().expect("pointer should exist");
 			pointer.button(
 				state,
 				&ButtonEvent {
@@ -200,9 +195,9 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			pointer.frame(state);
 		},
 		CompositorInputEvent::MouseButtonUp { button } => {
-			tracing::trace!("Mouse button up: {button:#x}");
+			tracing::trace!(target: "input", "Mouse button up: {button:#x}");
 
-			let pointer = state.seat.get_pointer().unwrap();
+			let pointer = state.seat.get_pointer().expect("pointer should exist");
 			pointer.button(
 				state,
 				&ButtonEvent {
@@ -215,45 +210,73 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			pointer.frame(state);
 		},
 		CompositorInputEvent::ScrollVertical { amount } => {
-			tracing::trace!("Scroll vertical: {amount}");
+			tracing::trace!(target: "input", "Scroll vertical: {amount}");
 
-			let pointer = state.seat.get_pointer().unwrap();
+			let pointer = state.seat.get_pointer().expect("pointer should exist");
 			pointer.axis(state, AxisFrame::new(time).value(Axis::Vertical, -(amount as f64)));
 			pointer.frame(state);
 		},
 		CompositorInputEvent::ScrollHorizontal { amount } => {
-			tracing::trace!("Scroll horizontal: {amount}");
+			tracing::trace!(target: "input", "Scroll horizontal: {amount}");
 
-			let pointer = state.seat.get_pointer().unwrap();
+			let pointer = state.seat.get_pointer().expect("pointer should exist");
 			pointer.axis(state, AxisFrame::new(time).value(Axis::Horizontal, amount as f64));
 			pointer.frame(state);
 		},
 	}
 }
 
-/// Clamp the cursor position to the output bounds.
+/// Clamp the cursor position to the output bounds, expanded to include
+/// the override window's geometry if one is active.
+///
+/// Gamescope: expands cursor bounds when a dropdown/override window is active
+/// so the cursor can move within the dropdown area without being clamped
+/// to the output bounds.
 fn clamp_cursor(state: &mut MoonshineCompositor) {
 	let output_size = state
 		.output
 		.current_mode()
 		.map(|m| m.size)
 		.unwrap_or((state.width as i32, state.height as i32).into());
-	state.cursor_position.x = state.cursor_position.x.clamp(0.0, (output_size.w - 1) as f64);
-	state.cursor_position.y = state.cursor_position.y.clamp(0.0, (output_size.h - 1) as f64);
+
+	// Start with output bounds.
+	let mut min_x: f64 = 0.0;
+	let mut min_y: f64 = 0.0;
+	let mut max_x: f64 = (output_size.w - 1) as f64;
+	let mut max_y: f64 = (output_size.h - 1) as f64;
+
+	// Expand bounds to include the override window's geometry if active.
+	// This allows the cursor to move within the dropdown area.
+	if let Some(ref override_win) = state.override_window {
+		if let Some(geo) = state.space.element_geometry(override_win) {
+			let override_min_x = geo.loc.x as f64;
+			let override_min_y = geo.loc.y as f64;
+			let override_max_x = (geo.loc.x + geo.size.w) as f64;
+			let override_max_y = (geo.loc.y + geo.size.h) as f64;
+			min_x = min_x.min(override_min_x);
+			min_y = min_y.min(override_min_y);
+			max_x = max_x.max(override_max_x);
+			max_y = max_y.max(override_max_y);
+		}
+	}
+
+	state.cursor_position.x = state.cursor_position.x.clamp(min_x, max_x);
+	state.cursor_position.y = state.cursor_position.y.clamp(min_y, max_y);
 }
 
 /// Find the Wayland surface under the current cursor position.
 ///
-/// In gamescope mode (override_surface is set), always routes to the focused
-/// game window to match gamescope's input behavior. This prevents stray
-/// override-redirect windows (Steam popups, etc.) from intercepting pointer
-/// events.
+/// Priority order:
+/// 1. If override_surface is active (WSI bypass), route to the focused game window.
+/// 2. If override_window (dropdown) is active, route to the dropdown.
+/// 3. Otherwise, find the surface under the cursor normally.
 fn find_surface_under(
 	state: &MoonshineCompositor,
 ) -> Option<(
 	<MoonshineCompositor as smithay::input::SeatHandler>::PointerFocus,
 	Point<f64, Logical>,
 )> {
+	// Priority 1: WSI override surface active — route to the focused game window.
 	if state.is_override_active() {
 		if let Some(wid) = state.focused_x11_window {
 			// XWayland path: find the focused X11 window and route events there.
@@ -289,6 +312,19 @@ fn find_surface_under(
 		}
 	}
 
+	// Priority 2: Override window (dropdown) is active — route to it.
+	// When a dropdown/menu/tooltip is registered, pointer events should
+	// go to it even if the cursor is over the game window.
+	if let Some(ref override_win) = state.override_window {
+		let override_loc = state.space.element_geometry(override_win)?.loc;
+		let pos_within_override = state.cursor_position - override_loc.to_f64();
+		if let Some((surface, surface_offset)) = override_win.surface_under(pos_within_override, WindowSurfaceType::ALL)
+		{
+			return Some((surface, surface_offset.to_f64() + override_loc.to_f64()));
+		}
+	}
+
+	// Priority 3: Normal cursor-based surface finding.
 	let (window, window_loc) = state.space.element_under(state.cursor_position)?;
 	let pos_within_window = state.cursor_position - window_loc.to_f64();
 	let (surface, surface_offset) = window.surface_under(pos_within_window, WindowSurfaceType::ALL)?;

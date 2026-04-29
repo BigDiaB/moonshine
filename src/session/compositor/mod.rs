@@ -13,6 +13,7 @@ mod handlers;
 pub mod input;
 mod protocols;
 mod state;
+mod x11_focus;
 
 use std::sync::mpsc;
 

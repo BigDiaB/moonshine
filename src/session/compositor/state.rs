@@ -23,6 +23,8 @@ use smithay::backend::renderer::{Bind, BufferType, ImportDma};
 use smithay::desktop::space::SpaceRenderElements;
 use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::desktop::utils::{take_presentation_feedback_surface_tree, OutputPresentationFeedback};
+use std::collections::HashMap;
+
 use smithay::desktop::Space;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::input::{Seat, SeatState};
@@ -53,18 +55,6 @@ use super::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, HdrMetadata};
 /// always have a free buffer: at most two frames are queued in the
 /// `sync_channel(2)` and one is being processed by the encoder.
 const BUFFER_POOL_SIZE: usize = 3;
-
-/// Cached X11 atom IDs, interned once on connection setup.
-pub struct CachedAtoms {
-	pub net_active_window: u32,
-	pub gamescope_focused_app: u32,
-	pub gamescope_focusable_apps: u32,
-	pub gamescope_focusable_windows: u32,
-	pub gamescope_hdr_output_feedback: u32,
-	pub gamescope_xwayland_server_id: u32,
-	pub xa_window: u32,
-	pub xa_cardinal: u32,
-}
 
 /// A pre-allocated GBM buffer slot in the compositor's buffer pool.
 pub(crate) struct GbmBufferSlot {
@@ -307,30 +297,70 @@ pub struct MoonshineCompositor {
 	/// The u32 is the associated X11 window ID (0 for native Wayland).
 	pub override_surface: Option<(WlSurface, u32)>,
 
-	/// X11 connection for setting focus and managing atoms when the game's
-	/// X11 window operates via the WSI layer.
-	/// Stores `(connection, root_window, cached_atoms)`.
-	pub x11_input_conn: Option<(smithay::reexports::x11rb::rust_connection::RustConnection, u32, CachedAtoms)>,
-
 	/// X11 window ID of the currently focused window (from Smithay's keyboard focus).
+	/// Used by the WSI layer to match override surfaces to focused windows.
 	pub focused_x11_window: Option<u32>,
 
-	/// App ID of the currently focused game (from steam_app_* window class).
-	/// Used to set GAMESCOPE_FOCUSED_APP on the root window so the Steam
-	/// client knows which game has focus.
-	pub focused_app_id: u32,
+	/// Currently active override window (dropdown, menu, tooltip).
+	/// Override windows are visually raised and may receive keyboard input
+	/// while the primary focus remains on the main game window.
+	/// Gamescope: `steamcompmgr_win_t::overrideWindow`
+	pub override_window: Option<smithay::desktop::Window>,
 
-	/// Cache mapping `(PID, process start time)` → Steam app ID to avoid
-	/// re-reading `/proc/{pid}/environ` on every focus event while still
-	/// distinguishing recycled PIDs from a previous process lifetime.
-	pub pid_app_id_cache: std::collections::HashMap<(u32, u64), u32>,
+	/// Currently active Steam overlay window (width > 1200 + STEAM_OVERLAY).
+	/// Gamescope: `focus_t::overlayWindow` — the main Steam overlay window.
+	pub overlay_window: Option<smithay::desktop::Window>,
 
-	/// When true, the next input event should re-set X11 focus to the client
-	/// window via our direct X11 connection. This is needed because XWayland's
-	/// internal `wl_keyboard.enter` handling sets X11 focus on the FRAME
-	/// window (from the reparenting WM), overriding Smithay's focus on the
-	/// client window.
-	pub x11_focus_needs_reset: bool,
+	/// Currently active Steam notification window (width <= 1200 + STEAM_OVERLAY).
+	/// Gamescope: `focus_t::notificationWindow` — small Steam notification popups.
+	pub notification_window: Option<smithay::desktop::Window>,
+
+	/// Currently active external overlay window (e.g., Discord, OBS).
+	/// Gamescope: `focus_t::externalOverlayWindow` — non-Steam overlays.
+	pub external_overlay_window: Option<smithay::desktop::Window>,
+
+	/// Pointer focus window — where mouse/pointer events are routed.
+	/// Separate from keyboard focus when an overlay has `inputFocusMode != 0`.
+	/// Gamescope: `focus_t::inputFocusWindow` — where pointer/mouse events go.
+	pub pointer_focus_window: Option<smithay::desktop::Window>,
+
+	/// Monotonically increasing damage sequence counter. Incremented on each
+	/// surface commit for game windows (app_id != 0). Used to detect when
+	/// a game window has drawn since the last focus change.
+	pub damage_sequence_counter: u64,
+
+	/// Monotonically increasing map sequence counter. Incremented each time
+	/// a window is mapped. Used as a tiebreaker in focus priority ranking
+	/// (step 10: later-mapped game windows win over earlier ones).
+	pub map_sequence_counter: u64,
+
+	/// X11 window ID of the last window that had keyboard focus.
+	/// Used for keyboard focus persistence — when a dropdown opens, keyboard
+	/// focus stays on this window rather than moving to the dropdown.
+	/// Gamescope: tracks keyboard focus separately from primary focus.
+	pub last_keyboard_focus_window: Option<u32>,
+
+	/// X11 connection to the XWayland display for reading root window
+	/// properties. Used to read Steam's focus control properties.
+	pub x11_focus: Option<super::x11_focus::X11Focus>,
+
+	/// Focus dirty-tracking state. Tracks whether focus has changed since
+	/// the last time it was applied, avoiding unnecessary recalculation.
+	/// Gamescope: `focus_t::ulCurrentFocusSerial` + `MakeFocusDirty()`.
+	pub focus_state: super::focus::FocusState,
+
+	/// Metadata for each window, used for focus priority decisions.
+	/// Mirrors the fields from `steamcompmgr_win_t` in gamescope.
+	pub window_metadata: std::collections::HashMap<smithay::desktop::Window, super::focus::WindowMetadata>,
+
+	/// Maps parent X11 window ID → list of transient child Windows.
+	/// Updated at map/unmap time for O(1) child lookup.
+	pub transient_children: std::collections::HashMap<u32, Vec<smithay::desktop::Window>>,
+
+	/// Set of X11 window IDs that have been identified as system tray icons
+	/// via _NET_SYSTEM_TRAY_OPCODE REQUEST_DOCK messages. These windows are
+	/// excluded from focus candidates via WindowFlags::SYS_TRAY_ICON.
+	pub sys_tray_icons: std::collections::HashSet<u32>,
 
 	// -- Direct scanout --
 	/// Client buffers held alive during direct scanout until the encoder
@@ -545,11 +575,20 @@ impl MoonshineCompositor {
 				wayland_display,
 				hdr: hdr_active,
 				override_surface: None,
-				x11_input_conn: None,
 				focused_x11_window: None,
-				focused_app_id: 0,
-				pid_app_id_cache: std::collections::HashMap::new(),
-				x11_focus_needs_reset: false,
+				override_window: None,
+				overlay_window: None,
+				notification_window: None,
+				external_overlay_window: None,
+				pointer_focus_window: None,
+				damage_sequence_counter: 0,
+				map_sequence_counter: 0,
+				last_keyboard_focus_window: None,
+				x11_focus: None,
+				focus_state: super::focus::FocusState::default(),
+				window_metadata: HashMap::new(),
+				transient_children: std::collections::HashMap::new(),
+				sys_tray_icons: std::collections::HashSet::new(),
 				held_scanout_buffers: Vec::new(),
 				scanout_buffer_map: std::collections::HashMap::new(),
 				scanout_next_index: BUFFER_POOL_SIZE,
@@ -694,10 +733,9 @@ impl MoonshineCompositor {
 				states
 					.data_map
 					.get::<std::sync::Mutex<CursorImageAttributes>>()
-					.unwrap()
-					.lock()
-					.unwrap()
-					.hotspot
+					.and_then(|m| m.lock().ok())
+					.map(|attrs| attrs.hotspot)
+					.unwrap_or_else(|| (0, 0).into())
 			})
 		} else {
 			(0, 0).into()
@@ -721,7 +759,10 @@ impl MoonshineCompositor {
 		// space elements — but only when the override's X11 window matches
 		// the currently focused window (or is 0 with no X11 focus).
 		if override_active {
-			let (override_surface, _) = self.override_surface.as_ref().unwrap();
+			let Some((override_surface, _)) = self.override_surface.as_ref() else {
+				tracing::warn!("override_active but override_surface is None");
+				return;
+			};
 			let override_elements: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
 				render_elements_from_surface_tree(
 					&mut self.renderer,
@@ -1230,6 +1271,63 @@ impl MoonshineCompositor {
 		})
 	}
 
+	/// Clear all dropdown/override windows.
+	///
+	/// Gamescope: `wlserver_clear_dropdowns()` — clears all dropdown surfaces
+	/// when focus changes. This ensures dropdowns don't persist across focus
+	/// changes and don't interfere with the new focus window.
+	pub fn clear_dropdowns(&mut self) {
+		if self.override_window.is_some() {
+			self.focus_state.mark_dirty();
+		}
+		self.override_window = None;
+		tracing::debug!(target: "focus", "Cleared dropdown/override windows");
+	}
+
+	/// Register a dropdown/override window.
+	///
+	/// Gamescope: `wlserver_notify_dropdown()` — registers a dropdown surface
+	/// with its position. This is called when a new dropdown/menu/tooltip
+	/// window is mapped and is a transient child of the focused window.
+	///
+	/// Also walks transient children to find nested dropdowns (e.g., submenu).
+	///
+	/// Returns `true` if the dropdown was successfully registered, `false`
+	/// if it was rejected (e.g., conflicts with notification/external overlay).
+	#[must_use = "dropdown registration result indicates success or rejection"]
+	pub fn notify_dropdown(&mut self, window: smithay::desktop::Window, x: i32, y: i32) -> bool {
+		// Don't register dropdown if it conflicts with notification or
+		// external overlay windows. Gamescope keeps these separate.
+		if self.notification_window.as_ref() == Some(&window) {
+			tracing::debug!(
+				target: "focus",
+				window_id = window.x11_surface().map(|x| x.window_id()),
+				"Rejecting dropdown: conflicts with notification window"
+			);
+			return false;
+		}
+		if self.external_overlay_window.as_ref() == Some(&window) {
+			tracing::debug!(
+				target: "focus",
+				window_id = window.x11_surface().map(|x| x.window_id()),
+				"Rejecting dropdown: conflicts with external overlay window"
+			);
+			return false;
+		}
+
+		self.override_window = Some(window.clone());
+		self.focus_state.mark_dirty();
+		tracing::debug!(
+			target: "focus",
+			window_id = window.x11_surface().map(|x| x.window_id()),
+			x,
+			y,
+			"Registered dropdown/override window"
+		);
+
+		true
+	}
+
 	/// Start the XWayland server so X11 applications can connect.
 	///
 	/// Spawns the XWayland process and registers it as a calloop
@@ -1294,53 +1392,10 @@ impl MoonshineCompositor {
 					data.xwm = Some(wm);
 					data.xdisplay = Some(display_number);
 
-					// Open a separate X11 connection for focus management
-					// and gamescope atom updates.
-					{
-						use smithay::reexports::x11rb::connection::Connection as _;
-						use smithay::reexports::x11rb::protocol::xproto::ConnectionExt as _;
-						use smithay::reexports::x11rb::rust_connection::RustConnection;
-						let display = format!(":{display_number}");
-						match RustConnection::connect(Some(&display)) {
-							Ok((conn, screen_num)) => {
-								let root = conn.setup().roots[screen_num].root;
-								tracing::debug!(display_number, root, "Opened X11 input connection.");
-
-								// Intern atoms once for the lifetime of this connection.
-								let intern = |name: &[u8], fallback: u32| -> u32 {
-									conn.intern_atom(false, name)
-										.ok()
-										.and_then(|c| c.reply().ok())
-										.map(|r| r.atom)
-										.unwrap_or(fallback)
-								};
-
-								let atoms = CachedAtoms {
-									net_active_window: intern(b"_NET_ACTIVE_WINDOW", 0),
-									gamescope_focused_app: intern(b"GAMESCOPE_FOCUSED_APP", 0),
-									gamescope_focusable_apps: intern(b"GAMESCOPE_FOCUSABLE_APPS", 0),
-									gamescope_focusable_windows: intern(b"GAMESCOPE_FOCUSABLE_WINDOWS", 0),
-									gamescope_hdr_output_feedback: intern(b"GAMESCOPE_HDR_OUTPUT_FEEDBACK", 0),
-									gamescope_xwayland_server_id: intern(b"GAMESCOPE_XWAYLAND_SERVER_ID", 0),
-									xa_window: intern(b"WINDOW", 33),
-									xa_cardinal: intern(b"CARDINAL", 6),
-								};
-
-								data.x11_input_conn = Some((conn, root, atoms));
-							},
-							Err(e) => {
-								tracing::warn!("Failed to open X11 input connection: {e}");
-							},
-						}
-					}
-
-					// Set gamescope X11 atoms for the WSI layer if HDR is active.
-					if data.color_management.is_some() {
-						if let Some((conn, root, atoms)) = &data.x11_input_conn {
-							data.set_gamescope_x11_atoms(conn, *root, atoms, display_number);
-						} else {
-							tracing::warn!("Cannot set gamescope X11 atoms: no X11 connection");
-						}
+					// Open an X11 connection to the XWayland display for
+					// reading root window properties (Steam focus control).
+					if data.x11_focus.is_none() {
+						data.x11_focus = super::x11_focus::X11Focus::open(display_number);
 					}
 
 					// Notify the session thread that XWayland is ready.
@@ -1360,36 +1415,6 @@ impl MoonshineCompositor {
 		if let Err(e) = ret {
 			tracing::error!("Failed to insert XWayland source into event loop: {e}");
 		}
-	}
-
-	/// Set gamescope-specific X11 atoms on the XWayland root window.
-	///
-	/// The gamescope WSI Vulkan layer reads these atoms from the root
-	/// window to determine if HDR output is enabled and to get the
-	/// XWayland server ID for override_window_content.
-	fn set_gamescope_x11_atoms(
-		&self,
-		conn: &smithay::reexports::x11rb::rust_connection::RustConnection,
-		root: u32,
-		atoms: &CachedAtoms,
-		display_number: u32,
-	) {
-		use smithay::reexports::x11rb::connection::Connection;
-		use smithay::reexports::x11rb::protocol::xproto::{AtomEnum, PropMode};
-		use smithay::reexports::x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
-
-		let set_cardinal = |atom: u32, values: &[u32]| {
-			let _ = conn.change_property32(PropMode::REPLACE, root, atom, AtomEnum::CARDINAL, values);
-		};
-
-		set_cardinal(atoms.gamescope_hdr_output_feedback, &[1]);
-		set_cardinal(atoms.gamescope_xwayland_server_id, &[0]);
-		set_cardinal(atoms.gamescope_focused_app, &[0]);
-		set_cardinal(atoms.gamescope_focusable_apps, &[]);
-		set_cardinal(atoms.gamescope_focusable_windows, &[]);
-
-		let _ = conn.flush();
-		tracing::debug!("Set gamescope X11 atoms on root window (display :{display_number})");
 	}
 
 	/// Shut down the application and XWayland server.
@@ -1414,6 +1439,12 @@ impl MoonshineCompositor {
 			Ok(s) if s.success() => tracing::debug!("Stopped moonshine-session.scope"),
 			Ok(s) => tracing::debug!("systemctl stop exited with {s}"),
 			Err(e) => tracing::warn!("Failed to stop moonshine-session.scope: {e}"),
+		}
+
+		// Clear the X11 focus control connection so reevaluate_focus
+		// can't read from a dead X11 display during cleanup.
+		if self.x11_focus.take().is_some() {
+			tracing::debug!("Cleared X11 focus control connection");
 		}
 
 		// Drop the X11 window manager, closing the privileged WM
