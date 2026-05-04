@@ -223,12 +223,17 @@ fn run_compositor(
 
 	// Synthesize plausible physical dimensions so games that check the
 	// display's physical size (e.g. Ghost of Tsushima) see a valid monitor
-	// instead of a 0x0mm virtual output.  Approximate a 27" display at
-	// the configured resolution's aspect ratio.
-	let aspect = config.width as f64 / config.height as f64;
+	// instead of a 0x0mm virtual output. Approximate a 27" display at
+	// the configured resolution's aspect ratio, but fall back to 16:9 if
+	// the configured dimensions are invalid.
 	let diag_mm = 686.0_f64; // 27 inches in mm
-	let h_mm = (diag_mm / (1.0 + aspect * aspect).sqrt()) as i32;
-	let w_mm = (h_mm as f64 * aspect) as i32;
+	let aspect = if config.width == 0 || config.height == 0 {
+		16.0_f64 / 9.0_f64
+	} else {
+		config.width as f64 / config.height as f64
+	};
+	let h_mm = ((diag_mm / (1.0 + aspect * aspect).sqrt()) as i32).max(1);
+	let w_mm = ((h_mm as f64 * aspect) as i32).max(1);
 
 	let output = Output::new(
 		"moonshine-virtual".to_string(),
