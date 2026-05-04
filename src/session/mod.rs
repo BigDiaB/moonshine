@@ -309,31 +309,33 @@ impl SessionInner {
 	}
 }
 
-/// Run a configured hook command, logging the result.
-/// Skips silently if the command is empty.
-fn run_hook(name: &str, command: &[String]) {
-	if command.is_empty() {
-		return;
-	}
+/// Run configured hook commands, logging the result of each.
+/// Commands are executed in order; skips silently if the list is empty.
+fn run_hook(name: &str, commands: &[Vec<String>]) {
+	for (i, command) in commands.iter().enumerate() {
+		if command.is_empty() {
+			continue;
+		}
 
-	let Some(program) = command.first() else {
-		return;
-	};
-	let args = &command[1..];
+		let Some(program) = command.first() else {
+			continue;
+		};
+		let args = &command[1..];
 
-	tracing::info!("{name}: running {:?}", command);
-	match Command::new(program)
-		.args(args)
-		.stdout(Stdio::null())
-		.stderr(Stdio::null())
-		.status()
-	{
-		Ok(status) => {
-			if !status.success() {
-				tracing::warn!("{name}: exited with {status}");
-			}
-		},
-		Err(e) => tracing::warn!("{name}: failed to run: {e}"),
+		tracing::info!("{name}[{i}]: running {:?}", command);
+		match Command::new(program)
+			.args(args)
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.status()
+		{
+			Ok(status) => {
+				if !status.success() {
+					tracing::warn!("{name}[{i}]: exited with {status}");
+				}
+			},
+			Err(e) => tracing::warn!("{name}[{i}]: failed to run: {e}"),
+		}
 	}
 }
 

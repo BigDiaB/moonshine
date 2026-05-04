@@ -137,17 +137,19 @@ pub struct ApplicationConfig {
 	/// The command to run.
 	pub command: Vec<String>,
 
-	/// Command to run before launching the application.
-	/// Runs synchronously — the application launch waits for it to finish.
+	/// Commands to run before launching the application.
+	/// Each inner Vec is a separate command; they execute in order.
+	/// Runs synchronously — the application launch waits for all to finish.
 	/// Useful for killing conflicting processes, setting GPU power states, etc.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub pre_command: Vec<String>,
+	pub pre_command: Vec<Vec<String>>,
 
-	/// Command to run after the streaming session ends.
-	/// Runs in the background — moonshine does not wait for it to finish.
+	/// Commands to run after the streaming session ends.
+	/// Each inner Vec is a separate command; they execute in order.
+	/// Runs in the background — moonshine does not wait for them to finish.
 	/// Useful for restoring system state (e.g. GPU power management).
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub post_command: Vec<String>,
+	pub post_command: Vec<Vec<String>>,
 }
 
 impl ApplicationConfig {
@@ -177,13 +179,13 @@ pub struct SteamApplicationScannerConfig {
 	/// The command to run.
 	pub command: Vec<String>,
 
-	/// Command to run before launching each scanned application.
+	/// Commands to run before launching each scanned application.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub pre_command: Vec<String>,
+	pub pre_command: Vec<Vec<String>>,
 
-	/// Command to run after each scanned application's session ends.
+	/// Commands to run after each scanned application's session ends.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub post_command: Vec<String>,
+	pub post_command: Vec<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
