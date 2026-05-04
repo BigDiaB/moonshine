@@ -251,8 +251,8 @@ fn clamp_cursor(state: &mut MoonshineCompositor) {
 		if let Some(geo) = state.space.element_geometry(override_win) {
 			let override_min_x = geo.loc.x as f64;
 			let override_min_y = geo.loc.y as f64;
-			let override_max_x = (geo.loc.x + geo.size.w) as f64;
-			let override_max_y = (geo.loc.y + geo.size.h) as f64;
+			let override_max_x = (geo.loc.x + geo.size.w - 1) as f64;
+			let override_max_y = (geo.loc.y + geo.size.h - 1) as f64;
 			min_x = min_x.min(override_min_x);
 			min_y = min_y.min(override_min_y);
 			max_x = max_x.max(override_max_x);
@@ -267,8 +267,12 @@ fn clamp_cursor(state: &mut MoonshineCompositor) {
 /// Find the Wayland surface under the current cursor position.
 ///
 /// Priority order:
-/// 1. If override_surface is active (WSI bypass), route to the focused game window.
-/// 2. If override_window (dropdown) is active, route to the dropdown.
+/// 1. If override_window (dropdown) is active AND override_surface is NOT
+///    active, route to the dropdown.  When the WSI bypass is active the
+///    renderer replaces the entire space with the bypass surface, so
+///    dropdown windows are not rendered — routing to them would make them
+///    receive clicks while being invisible.
+/// 2. If override_surface is active (WSI bypass), route to the focused game window.
 /// 3. Otherwise, find the surface under the cursor normally.
 fn find_surface_under(
 	state: &MoonshineCompositor,
@@ -276,7 +280,24 @@ fn find_surface_under(
 	<MoonshineCompositor as smithay::input::SeatHandler>::PointerFocus,
 	Point<f64, Logical>,
 )> {
-	// Priority 1: WSI override surface active — route to the focused game window.
+	// Priority 1: Override window (dropdown) is active — route to it.
+	// Only do this when the WSI bypass surface is NOT active.  When
+	// override_surface is active the renderer replaces the entire space
+	// with the bypass surface, so dropdown windows are not rendered —
+	// routing to them would make invisible windows intercept clicks.
+	if state.override_window.is_some() && !state.is_override_active() {
+		if let Some(ref override_win) = state.override_window {
+			let override_loc = state.space.element_geometry(override_win)?.loc;
+			let pos_within_override = state.cursor_position - override_loc.to_f64();
+			if let Some((surface, surface_offset)) =
+				override_win.surface_under(pos_within_override, WindowSurfaceType::ALL)
+			{
+				return Some((surface, surface_offset.to_f64() + override_loc.to_f64()));
+			}
+		}
+	}
+
+	// Priority 2: WSI override surface active — route to the focused game window.
 	if state.is_override_active() {
 		if let Some(wid) = state.focused_x11_window {
 			// XWayland path: find the focused X11 window and route events there.
@@ -309,18 +330,6 @@ fn find_surface_under(
 			if let Some((ref override_surface, _)) = state.override_surface {
 				return Some((override_surface.clone(), Point::from((0.0, 0.0))));
 			}
-		}
-	}
-
-	// Priority 2: Override window (dropdown) is active — route to it.
-	// When a dropdown/menu/tooltip is registered, pointer events should
-	// go to it even if the cursor is over the game window.
-	if let Some(ref override_win) = state.override_window {
-		let override_loc = state.space.element_geometry(override_win)?.loc;
-		let pos_within_override = state.cursor_position - override_loc.to_f64();
-		if let Some((surface, surface_offset)) = override_win.surface_under(pos_within_override, WindowSurfaceType::ALL)
-		{
-			return Some((surface, surface_offset.to_f64() + override_loc.to_f64()));
 		}
 	}
 

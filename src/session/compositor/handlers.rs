@@ -45,6 +45,7 @@ use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState}
 use smithay::xwayland::xwm::{Reorder, ResizeEdge, XwmId};
 use smithay::xwayland::{X11Surface, X11Wm, XwmHandler};
 
+use smithay::wayland::seat::WaylandFocus;
 use smithay::xwayland::XWaylandClientData;
 
 use super::focus::{get_window_priority_key, KeyboardFocusTarget, WindowFlags, WindowMetadata};
@@ -58,31 +59,60 @@ use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use std::time::Instant;
 
-/// Simple PID → app_id cache with TTL to avoid re-reading `/proc/<pid>/cmdline`
-/// across multiple focus evaluations. Processes in a Steam game tree (Steam →
-/// reaper → proton → game) are stable, so caching with a short TTL is safe.
-static APPID_CACHE: OnceLock<RwLock<HashMap<u32, (u32, Instant)>>> = OnceLock::new();
+type AppIdCacheKey = (u32, u64);
+type AppIdCacheValue = (u32, Instant);
+type AppIdCache = RwLock<HashMap<AppIdCacheKey, AppIdCacheValue>>;
+
+/// PID → app_id cache keyed on `(pid, starttime)` to avoid stale hits after
+/// PID reuse. Processes in a Steam game tree (Steam → reaper → proton → game)
+/// are stable, so caching with a short TTL is safe.
+static APPID_CACHE: OnceLock<AppIdCache> = OnceLock::new();
 
 /// TTL for cached app_id results — 5 seconds. Processes die and respawn,
 /// but within a single gaming session the PIDs are stable.
 const APPID_CACHE_TTL_SECS: u64 = 5;
 
-/// Look up a cached app_id for a PID, respecting TTL.
-fn cache_get(pid: u32) -> Option<u32> {
-	let cache = APPID_CACHE.get_or_init(|| RwLock::new(HashMap::new())).read().unwrap();
-	cache.get(&pid).and_then(|(app_id, time)| {
-		if time.elapsed().as_secs() < APPID_CACHE_TTL_SECS {
-			Some(*app_id)
-		} else {
-			None
-		}
-	})
+/// Read `/proc/<pid>/stat` to extract the starttime field (field 22).
+/// Returns the raw clock ticks since boot — not wall-clock time.
+fn get_pid_starttime(pid: u32) -> Option<u64> {
+	let stat_path = format!("/proc/{}/stat", pid);
+	let proc_stat = std::fs::read_to_string(&stat_path).ok()?;
+
+	// Parse the process name (between first '(' and last ')') and the
+	// fields after the closing paren.
+	let proc_name_end = proc_stat.rfind(')')?;
+	let fields_after = proc_stat[proc_name_end + 2..].split_whitespace().collect::<Vec<&str>>();
+
+	// fields_after[0] = state, [1] = ppid, ..., [19] = starttime (0-indexed: 19)
+	// starttime is the 22nd field overall (index 21 in full /proc/pid/stat)
+	// but after stripping "name (state ppid ...)", starttime is at index 19.
+	fields_after.get(19).and_then(|s| s.parse::<u64>().ok())
 }
 
-/// Store an app_id result in the cache.
+/// Look up a cached app_id for a PID, respecting (pid, starttime) key and TTL.
+/// Removes expired entries on read to prevent unbounded cache growth.
+fn cache_get(pid: u32) -> Option<u32> {
+	let starttime = get_pid_starttime(pid)?;
+	let cache = APPID_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+	let entry = cache.read().unwrap().get(&(pid, starttime)).cloned();
+	match entry {
+		Some((app_id, time)) if time.elapsed().as_secs() < APPID_CACHE_TTL_SECS => Some(app_id),
+		Some(_) => {
+			// Entry expired — remove it.
+			cache.write().unwrap().remove(&(pid, starttime));
+			None
+		},
+		None => None,
+	}
+}
+
+/// Store an app_id result in the cache keyed on (pid, starttime).
 fn cache_set(pid: u32, app_id: u32) {
+	let starttime = get_pid_starttime(pid);
 	let mut cache = APPID_CACHE.get_or_init(|| RwLock::new(HashMap::new())).write().unwrap();
-	cache.insert(pid, (app_id, Instant::now()));
+	if let Some(start) = starttime {
+		cache.insert((pid, start), (app_id, Instant::now()));
+	}
 }
 
 /// Walk the process tree starting from `pid`, looking for Steam app ID.
@@ -179,7 +209,7 @@ fn get_appid_from_pid(pid: u32) -> u32 {
 		// If this is a reaper process, read its cmdline to find SteamLaunch.
 		if proc_name == "reaper" {
 			let cmdline_path = format!("/proc/{}/cmdline", next_pid);
-			if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+			if let Ok(cmdline) = std::fs::read(&cmdline_path) {
 				let app_id = scan_cmdline_for_app_id(&cmdline);
 				if app_id != 0 {
 					cache_set(next_pid, app_id);
@@ -208,7 +238,7 @@ fn get_appid_from_pid(pid: u32) -> u32 {
 
 		// Check the current process's cmdline for SteamLaunch or steamwebhelper.
 		let cmdline_path = format!("/proc/{}/cmdline", next_pid);
-		if let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) {
+		if let Ok(cmdline) = std::fs::read(&cmdline_path) {
 			let app_id = scan_cmdline_for_app_id(&cmdline);
 			if app_id != 0 {
 				cache_set(next_pid, app_id);
@@ -230,20 +260,24 @@ fn get_appid_from_pid(pid: u32) -> u32 {
 /// Detects two patterns:
 ///   - `SteamLaunch AppId=<N>` — classic Steam launch
 ///   - `--appids=<N>` — Proton steamwebhelper launch
-fn scan_cmdline_for_app_id(cmdline: &str) -> u32 {
+///
+/// Accepts raw bytes because `/proc/<pid>/cmdline` is not guaranteed UTF-8.
+fn scan_cmdline_for_app_id(cmdline: &[u8]) -> u32 {
 	let mut found_steam_launch = false;
 	let mut app_id: u32 = 0;
 
-	for part in cmdline.split('\0') {
+	for part in cmdline.split(|&b| b == b'\0') {
 		// Check for --appids= BEFORE "--" break — --appids= may appear
 		// after "--" in some launchers (e.g., "steamwebhelper -- --appids=12345").
-		if let Some(ids_str) = part.strip_prefix("--appids=") {
+		if let Some(ids_str) = part.strip_prefix(b"--appids=") {
 			// Proton steamwebhelper: --appids=<N> or --appids=<N>,<N>...
-			for id_str in ids_str.split(',') {
-				if let Ok(id) = id_str.trim().parse::<u32>() {
-					if id != 0 {
-						app_id = id;
-						break;
+			for id_str in ids_str.split(|&b| b == b',') {
+				if let Ok(s) = std::str::from_utf8(id_str.trim_ascii()) {
+					if let Ok(id) = s.parse::<u32>() {
+						if id != 0 {
+							app_id = id;
+							break;
+						}
 					}
 				}
 			}
@@ -252,14 +286,29 @@ fn scan_cmdline_for_app_id(cmdline: &str) -> u32 {
 			}
 		}
 
-		if part == "SteamLaunch" {
+		if part == b"SteamLaunch" {
 			found_steam_launch = true;
-		} else if found_steam_launch && part.starts_with("AppId=") {
-			if let Some(id_str) = part.strip_prefix("AppId=") {
-				if let Ok(id) = id_str.parse::<u32>() {
-					if id != 0 {
-						app_id = id;
-						break;
+		} else if found_steam_launch && part.starts_with(b"AppId=") {
+			if let Some(id_str) = part.strip_prefix(b"AppId=") {
+				if let Ok(s) = std::str::from_utf8(id_str.trim_ascii()) {
+					if let Ok(id) = s.parse::<u32>() {
+						if id != 0 {
+							app_id = id;
+							break;
+						}
+					}
+				}
+			}
+		}
+		// Also detect standalone AppId=<N> without SteamLaunch prefix
+		// (some launchers may use just AppId=N directly).
+		if part.starts_with(b"AppId=") {
+			if let Some(id_str) = part.strip_prefix(b"AppId=") {
+				if let Ok(s) = std::str::from_utf8(id_str.trim_ascii()) {
+					if let Ok(id) = s.parse::<u32>() {
+						if id != 0 && app_id == 0 {
+							app_id = id;
+						}
 					}
 				}
 			}
@@ -272,7 +321,8 @@ fn scan_cmdline_for_app_id(cmdline: &str) -> u32 {
 
 	if app_id == 0 {
 		// Replace null bytes with spaces for readable debug output.
-		let readable = cmdline.replace('\0', " ");
+		let readable: Vec<u8> = cmdline.iter().map(|&b| if b == b'\0' { b' ' } else { b }).collect();
+		let readable = String::from_utf8_lossy(&readable);
 		tracing::debug!(target: "focus", cmdline = %readable, "scan_cmdline_for_app_id: no app_id found in cmdline");
 	}
 
@@ -417,6 +467,35 @@ impl MoonshineCompositor {
 			}
 		}
 		self.window_metadata.remove(window);
+	}
+
+	/// Check if an X11 window is transient-for (directly or transitively)
+	/// the currently focused X11 window. Walks the transient-for chain
+	/// upward to support nested popups (submenus, tooltips inside menus).
+	fn is_transient_of_focused(&self, window_id: u32) -> bool {
+		let focused_id = match self.focused_x11_window {
+			Some(id) => id,
+			None => return false,
+		};
+		if window_id == focused_id {
+			return true;
+		}
+		let mut current = window_id;
+		let mut visited = std::collections::HashSet::new();
+		visited.insert(current);
+		for _ in 0..10 {
+			let parent = self
+				.window_metadata
+				.iter()
+				.find(|(_, m)| m.x11_window_id == Some(current))
+				.and_then(|(_, m)| m.transient_for);
+			match parent {
+				Some(p) if p == focused_id => return true,
+				Some(p) if visited.insert(p) => current = p,
+				_ => break,
+			}
+		}
+		false
 	}
 
 	/// Build WindowMetadata from an X11 surface for focus priority decisions.
@@ -633,6 +712,7 @@ impl MoonshineCompositor {
 		let mut best_notification: Option<Window> = None;
 		let mut best_external_overlay: Option<Window> = None;
 		let mut max_overlay_opacity = 0u32;
+		let mut max_notification_opacity = 0u32;
 		let mut max_external_overlay_opacity = 0u32;
 
 		for window in windows {
@@ -641,8 +721,9 @@ impl MoonshineCompositor {
 					best_overlay = Some(window.clone());
 					max_overlay_opacity = meta.opacity;
 				}
-				if meta.flags.contains(WindowFlags::NOTIFICATION) {
+				if meta.flags.contains(WindowFlags::NOTIFICATION) && meta.opacity >= max_notification_opacity {
 					best_notification = Some(window.clone());
+					max_notification_opacity = meta.opacity;
 				}
 				if meta.flags.contains(WindowFlags::EXTERNAL_OVERLAY) && meta.opacity >= max_external_overlay_opacity {
 					best_external_overlay = Some(window.clone());
@@ -724,7 +805,9 @@ impl MoonshineCompositor {
 		// These are set by client_message_event() when smithay's XWM receives
 		// a _NET_ACTIVE_WINDOW ClientMessage from a client (e.g. Wine/Proton).
 		// Takes precedence over Steam focus control and priority ranking.
-		if let Some(requested_id) = self.focus_state.take_requested_focus() {
+		// Only consume the request if the window is actually in the candidate
+		// list — otherwise preserve it for the next evaluation cycle.
+		if let Some(requested_id) = self.focus_state.peek_requested_focus() {
 			if let Some(w) = candidates
 				.iter()
 				.find(|w| w.x11_surface().is_some_and(|x| x.window_id() == requested_id))
@@ -734,6 +817,7 @@ impl MoonshineCompositor {
 					window_id = requested_id,
 					"_NET_ACTIVE_WINDOW: honoring explicit focus request"
 				);
+				self.focus_state.clear_requested_focus();
 				return Some(w);
 			}
 			let exists_but_filtered = self
@@ -744,7 +828,7 @@ impl MoonshineCompositor {
 				target: "focus",
 				window_id = requested_id,
 				exists_but_filtered,
-				"_NET_ACTIVE_WINDOW: requested window not in candidates, falling through"
+				"_NET_ACTIVE_WINDOW: requested window not in candidates, preserving request"
 			);
 		}
 
@@ -761,44 +845,71 @@ impl MoonshineCompositor {
 				"Steam focus control read"
 			);
 			let fc = fc?;
+
+			// Step 1: Try exact window ID match.
 			if let Some(target_window) = fc.window {
-				candidates
+				if let Some(w) = candidates
 					.iter()
 					.find(|w| w.x11_surface().is_some_and(|x| x.window_id() == target_window))
-					.inspect(|w| {
-						if let Some(x11) = w.x11_surface() {
-							let app_id = self.window_metadata.get(w).map(|m| m.app_id);
-							tracing::debug!(
-								target: "focus",
-								steam_target_x11 = target_window,
-								candidate_x11 = x11.window_id(),
-								candidate_app_id = ?app_id,
-								"Steam focus matched X11 window"
-							);
-						}
-					})
-			} else if !fc.app_ids.is_empty() {
-				candidates
-					.iter()
-					.find(|w| {
-						self.window_metadata
-							.get(w)
-							.is_some_and(|m| fc.app_ids.contains(&m.app_id))
-					})
-					.inspect(|w| {
+				{
+					if let Some(x11) = w.x11_surface() {
 						let app_id = self.window_metadata.get(w).map(|m| m.app_id);
 						tracing::debug!(
 							target: "focus",
-							steam_target_appids = ?fc.app_ids,
-							matched_app_id = ?app_id,
-							candidate_x11 = w.x11_surface().map(|x| x.window_id()),
-							"Steam focus matched app ID"
+							steam_target_x11 = target_window,
+							candidate_x11 = x11.window_id(),
+							candidate_app_id = ?app_id,
+							"Steam focus matched X11 window"
 						);
-					})
-			} else {
-				tracing::debug!(target: "focus", "Steam focus control has no window or app_ids");
-				None
+					}
+					return Some(w);
+				}
+				// Exact window ID not found — fall through to app-id list.
+				// The window may have been recreated or filtered out; the
+				// app-id list provides a fallback so focus doesn't jump to
+				// an unrelated candidate during window transitions.
 			}
+
+			// Step 2: Try app-id list match, selecting the highest-priority
+			// candidate among all windows matching any of the requested app IDs.
+			// When multiple windows share the same Steam app ID (main window
+			// plus dialogs/children), priority ranking picks the best one
+			// instead of relying on unordered space iteration.
+			if !fc.app_ids.is_empty() {
+				let mut best: Option<&Window> = None;
+				let mut best_key = get_window_priority_key(&WindowMetadata::default());
+				for w in candidates {
+					if self
+						.window_metadata
+						.get(w)
+						.is_some_and(|m| fc.app_ids.contains(&super::x11_focus::AppId(m.app_id)))
+					{
+						let key = self
+							.window_metadata
+							.get(w)
+							.map(get_window_priority_key)
+							.unwrap_or_default();
+						if best.is_none_or(|_| key > best_key) {
+							best = Some(w);
+							best_key = key;
+						}
+					}
+				}
+				if let Some(w) = best {
+					let app_id = self.window_metadata.get(w).map(|m| m.app_id);
+					tracing::debug!(
+						target: "focus",
+						steam_target_appids = ?fc.app_ids,
+						matched_app_id = ?app_id,
+						candidate_x11 = w.x11_surface().map(|x| x.window_id()),
+						"Steam focus matched app ID (priority-selected)"
+					);
+					return Some(w);
+				}
+			}
+
+			tracing::debug!(target: "focus", "Steam focus control has no window or app_ids");
+			None
 		});
 
 		match steam_best {
@@ -820,11 +931,34 @@ impl MoonshineCompositor {
 		// Clear override window when primary focus changes.
 		// Gamescope: `wlserver_clear_dropdowns()` — when focus moves,
 		// all override windows are dismissed.
-		let old_focused = self.focused_x11_window;
+		let old_focused_x11 = self.focused_x11_window;
+		let old_focused_window = self.focused_window.clone();
+
 		if let Some(x11) = best.x11_surface() {
 			self.focused_x11_window = Some(x11.window_id());
+		} else {
+			// Wayland-native window: clear X11 focus tracking so stale X11
+			// window IDs don't linger and mislead subsequent focus evaluations.
+			self.focused_x11_window = None;
 		}
-		if old_focused != self.focused_x11_window {
+		self.focused_window = Some(best.clone());
+
+		// Write GAMESCOPE_FOCUSED_APP so Steam knows which app is focused
+		// (controller routing). Gamescope: writes GAMESCOPE_FOCUSED_APP to
+		// the root window when focus changes.
+		if let Some(ref x11_focus) = self.x11_focus {
+			let focused_app_id = self.window_metadata.get(best).map(|m| m.app_id).unwrap_or(0);
+			if focused_app_id != 0 {
+				x11_focus.set_focused_app(focused_app_id);
+			} else {
+				x11_focus.clear_focused_app();
+			}
+		}
+
+		// Focus changed if either the X11 window ID or the actual window changed.
+		let focus_changed = old_focused_x11 != self.focused_x11_window
+			|| old_focused_window.as_ref().and_then(|w| w.wl_surface()) != best.wl_surface();
+		if focus_changed {
 			self.clear_dropdowns();
 		}
 
@@ -861,27 +995,18 @@ impl MoonshineCompositor {
 		};
 
 		// Activation state: call set_activated on old and new XDG toplevels.
-		{
-			let old_window = old_focused.and_then(|wid| {
-				self.space
-					.elements()
-					.find(|e| e.x11_surface().is_some_and(|x| x.window_id() == wid))
-					.cloned()
-			});
-
-			if let Some(ref old_win) = old_window {
-				if old_win.toplevel().is_some() && old_win != best {
-					old_win.set_activated(false);
-				}
+		// Deactivate the old window whether it was X11 or Wayland.
+		if let Some(ref old_win) = old_focused_window {
+			if old_win.toplevel().is_some() && old_win != best {
+				old_win.set_activated(false);
 			}
-
-			if best.toplevel().is_some() {
-				best.set_activated(true);
-			}
+		}
+		if best.toplevel().is_some() {
+			best.set_activated(true);
 		}
 
 		// Keyboard focus persistence.
-		let primary_focus_changed = old_focused != self.focused_x11_window;
+		let primary_focus_changed = old_focused_x11 != self.focused_x11_window;
 		if primary_focus_changed {
 			if let Some(x11) = keyboard_target.as_ref().and_then(|w| w.x11_surface()) {
 				self.last_keyboard_focus_window = Some(x11.window_id());
@@ -901,15 +1026,27 @@ impl MoonshineCompositor {
 			}
 		}
 
-		// Send initial pointer motion event to the focused window to establish
+		// Force XSetInputFocus for X11 windows — necessary for GloballyActive
+		// / WM_TAKE_FOCUS windows (WmHints { input: false }, e.g. HFW under
+		// Proton) where Smithay only sends WM_TAKE_FOCUS but never calls
+		// XSetInputFocus, so the game never receives FocusIn → WM_ACTIVATE.
+		if let Some(ref x11_focus) = self.x11_focus {
+			if let Some(x11) = keyboard_target.as_ref().and_then(|w| w.x11_surface()) {
+				x11_focus.set_input_focus(x11.window_id());
+			}
+		}
+
+		// Send initial pointer motion event to the pointer focus window to establish
 		// pointer focus so that subsequent mouse events are delivered there.
+		// Use pointer_target (not keyboard_target) — when input_focus_mode != 0
+		// the overlay gets pointer events while the game gets keyboard events.
 		//
 		// surface_loc is the window's origin in compositor space (from space
 		// geometry), NOT the cursor position. Smithay computes cursor-within-
 		// surface as (event.location - surface_loc), so using cursor_position
 		// as surface_loc would always report the cursor at (0,0) inside the
 		// window and cause XWayland to deliver EnterNotify with event_x/y=0.
-		if let Some(ref target) = keyboard_target {
+		if let Some(ref target) = pointer_target {
 			if let Some(x11) = target.x11_surface() {
 				if let Some(wl_surface) = x11.wl_surface() {
 					let window_loc = self
@@ -928,6 +1065,36 @@ impl MoonshineCompositor {
 					pointer.motion(
 						self,
 						Some((wl_surface.clone(), window_loc)),
+						&MotionEvent {
+							location: self.cursor_position,
+							serial,
+							time: self.clock.now().as_millis(),
+						},
+					);
+					pointer.frame(self);
+				}
+			} else if target.wl_surface().is_some() {
+				// For Wayland targets, establish pointer focus by sending a
+				// motion event. Without this, pointer focus stays on the
+				// previous surface until the user moves the mouse.
+				let window_loc = self
+					.space
+					.element_geometry(target)
+					.map(|g| g.loc.to_f64())
+					.unwrap_or_default();
+				let pointer = self.seat.get_pointer().expect("pointer should exist");
+				let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+				tracing::debug!(
+					target: "focus",
+					surface_id = ?target.wl_surface().as_ref().map(|s| s.id()),
+					cursor = ?self.cursor_position,
+					"apply_focus: sending initial pointer motion event for Wayland"
+				);
+				if let Some(surface_cow) = target.wl_surface() {
+					let wl_surface = surface_cow.as_ref().clone();
+					pointer.motion(
+						self,
+						Some((wl_surface, window_loc)),
 						&MotionEvent {
 							location: self.cursor_position,
 							serial,
@@ -968,15 +1135,64 @@ impl MoonshineCompositor {
 		// Step 3: Build candidate list.
 		let mut candidates = self.build_candidates(&windows);
 
+		// Write focusable apps and windows so Steam knows which apps/windows
+		// are focusable (controller routing). Gamescope: writes
+		// GAMESCOPE_FOCUSABLE_APPS and GAMESCOPE_FOCUSABLE_WINDOWS to the root
+		// window so Steam can route controller input to the correct app.
+		// GAMESCOPE_FOCUSABLE_WINDOWS uses [window_id, app_id, pid] triplets.
+		if let Some(ref x11_focus) = self.x11_focus {
+			let focusable_app_ids: Vec<u32> = candidates
+				.iter()
+				.filter_map(|w| self.window_metadata.get(w).map(|m| m.app_id))
+				.filter(|&aid| aid != 0)
+				.collect();
+			let focusable_triplets: Vec<[u32; 3]> = candidates
+				.iter()
+				.filter_map(|w| {
+					let x11 = w.x11_surface()?;
+					let window_id = x11.window_id();
+					let meta = self.window_metadata.get(w)?;
+					let app_id = meta.app_id;
+					// Read PID from the cached metadata or fall back to 0.
+					let pid = meta
+						.x11_window_id
+						.map(|_| {
+							// We don't have PID stored in metadata; read it from X11.
+							x11_focus.get_window_pid(window_id)
+						})
+						.unwrap_or(0);
+					Some([window_id, app_id, pid])
+				})
+				.collect();
+			if !focusable_app_ids.is_empty() {
+				x11_focus.set_focusable_apps(&focusable_app_ids);
+			} else {
+				x11_focus.clear_focusable_apps();
+			}
+			if !focusable_triplets.is_empty() {
+				x11_focus.set_focusable_windows(&focusable_triplets);
+			} else {
+				x11_focus.clear_focusable_windows();
+			}
+		}
+
 		// Handle no candidates — clear old focus.
 		if candidates.is_empty() {
 			if self.focused_x11_window.is_some() {
 				self.focused_x11_window = None;
-				if let Some(keyboard) = self.seat.get_keyboard() {
-					keyboard.unset_grab(self);
-				}
-				self.focus_state.apply();
 			}
+			// Always clear keyboard focus when there are no candidates,
+			// even if the last focused window was a Wayland window
+			// (focused_x11_window == None). Without this, Smithay keyboard
+			// focus can remain on a dead Wayland surface.
+			if let Some(keyboard) = self.seat.get_keyboard() {
+				let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+				keyboard.set_focus(self, None, serial);
+			}
+			if let Some(ref x11_focus) = self.x11_focus {
+				x11_focus.clear_focused_app();
+			}
+			self.focus_state.apply();
 			return;
 		}
 		tracing::debug!(
@@ -1146,7 +1362,7 @@ impl XdgShellHandler for MoonshineCompositor {
 	}
 
 	fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-		// Remove metadata for destroyed XDG toplevels.
+		// Remove metadata for destroyed XDG toplevels and unmap from space.
 		let target = surface.wl_surface();
 		let window = self
 			.space
@@ -1156,7 +1372,12 @@ impl XdgShellHandler for MoonshineCompositor {
 
 		if let Some(window) = window {
 			self.unregister_window(&window);
+			self.space.unmap_elem(&window);
 		}
+
+		// Re-evaluate focus — if the destroyed window had keyboard focus,
+		// Smithay still targets that dead surface until focus is recomputed.
+		self.reevaluate_focus();
 	}
 
 	fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
@@ -1172,10 +1393,10 @@ impl XdgShellHandler for MoonshineCompositor {
 					if let Some(size) = state.size {
 						meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
 					}
-					self.focus_state.mark_dirty();
 				}
 			}
 		}
+		self.reevaluate_focus();
 	}
 
 	fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
@@ -1190,10 +1411,10 @@ impl XdgShellHandler for MoonshineCompositor {
 					if let Some(size) = state.size {
 						meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
 					}
-					self.focus_state.mark_dirty();
 				}
 			}
 		}
+		self.reevaluate_focus();
 	}
 
 	fn app_id_changed(&mut self, surface: ToplevelSurface) {
@@ -1204,11 +1425,11 @@ impl XdgShellHandler for MoonshineCompositor {
 				if let Some(client) = surface.wl_surface().client() {
 					if let Ok(creds) = client.get_credentials(&self.display_handle) {
 						meta.app_id = get_appid_from_pid(creds.pid as u32);
-						self.focus_state.mark_dirty();
 					}
 				}
 			}
 		}
+		self.reevaluate_focus();
 	}
 
 	fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
@@ -1295,10 +1516,7 @@ impl PointerConstraintsHandler for MoonshineCompositor {
 			let origin = self
 				.space
 				.elements()
-				.find_map(|window| {
-					use smithay::wayland::seat::WaylandFocus;
-					(window.wl_surface().as_deref() == Some(surface)).then(|| window.geometry())
-				})
+				.find_map(|window| (window.wl_surface().as_deref() == Some(surface)).then(|| window.geometry()))
 				.unwrap_or_default()
 				.loc
 				.to_f64();
@@ -1497,6 +1715,60 @@ impl XwmHandler for MoonshineCompositor {
 			?property,
 			"X11 property notify (focus-relevant)"
 		);
+
+		// Re-read metadata fields that are derived from the changed property
+		// and update the stored metadata. reevaluate_focus() only refreshes
+		// STEAM_INPUT_FOCUS and app_id; stale Hints/TransientFor/WindowType
+		// derived fields must be explicitly refreshed here.
+		let win_elem = self
+			.space
+			.elements()
+			.find(|e| e.x11_surface().is_some_and(|x| x.window_id() == window.window_id()))
+			.cloned();
+		if let Some(elem) = win_elem {
+			let new_meta = self.x11_surface_metadata(&window);
+			if let Some(meta) = self.window_metadata.get_mut(&elem) {
+				// Selectively update only the fields that can change from these
+				// property notifications. Preserve sequence numbers.
+				match property {
+					smithay::xwayland::xwm::WmWindowProperty::Hints => {
+						meta.disabled = new_meta.disabled;
+					},
+					smithay::xwayland::xwm::WmWindowProperty::TransientFor => {
+						let old_parent = meta.transient_for;
+						let new_parent = new_meta.transient_for;
+						meta.transient_for = new_parent;
+						meta.skip_taskbar = new_meta.skip_taskbar;
+						meta.skip_pager = new_meta.skip_pager;
+						meta.maybe_a_dropdown = new_meta.maybe_a_dropdown;
+
+						// Update transient_children index when transient_for changes.
+						// Remove from old parent's child list.
+						if let Some(old_parent) = old_parent {
+							if let Some(children) = self.transient_children.get_mut(&old_parent) {
+								children.retain(|w| *w != elem);
+								if children.is_empty() {
+									self.transient_children.remove(&old_parent);
+								}
+							}
+						}
+						// Add to new parent's child list.
+						if let Some(new_parent) = new_parent {
+							self.transient_children
+								.entry(new_parent)
+								.or_default()
+								.push(elem.clone());
+						}
+					},
+					smithay::xwayland::xwm::WmWindowProperty::WindowType => {
+						meta.is_dialog = new_meta.is_dialog;
+						meta.maybe_a_dropdown = new_meta.maybe_a_dropdown;
+					},
+					_ => {}, // Pid handled by refresh_metadata() in reevaluate_focus
+				}
+			}
+		}
+
 		self.reevaluate_focus();
 	}
 
@@ -1512,6 +1784,10 @@ impl XwmHandler for MoonshineCompositor {
 				"_NET_ACTIVE_WINDOW request received via XwmHandler"
 			);
 			self.focus_state.set_requested_focus(window);
+			// Act on the request immediately — without this, explicit focus
+			// requests from Wine/Proton can sit pending forever until some
+			// unrelated focus event triggers reevaluate_focus().
+			self.reevaluate_focus();
 		} else if type_name == "_NET_SYSTEM_TRAY_OPCODE" {
 			// Identify system tray icon windows sent via the XEMBED tray protocol.
 			// Wine's explorer.exe sends REQUEST_DOCK (opcode=0) to the tray selection
@@ -1537,7 +1813,9 @@ impl XwmHandler for MoonshineCompositor {
 				{
 					meta.flags.insert(WindowFlags::SYS_TRAY_ICON);
 				}
-				self.focus_state.mark_dirty();
+				// Re-evaluate focus immediately so the tray icon is excluded
+				// from the candidate list and GAMESCOPE focusable properties.
+				self.reevaluate_focus();
 			}
 		}
 	}
@@ -1647,8 +1925,12 @@ impl XwmHandler for MoonshineCompositor {
 		let meta = self.x11_surface_metadata(&window);
 		let parent_id = meta.transient_for;
 		let is_dropdown = meta.is_dropdown();
-		let is_focused_child = parent_id == self.focused_x11_window;
+
+		// Insert metadata BEFORE calling is_transient_of_focused so that
+		// the transient chain lookup can find this window's parent entry.
 		self.window_metadata.insert(win.clone(), meta);
+
+		let is_focused_child = self.is_transient_of_focused(window.window_id());
 
 		// Register transient children index.
 		if let Some(parent_id) = parent_id {
@@ -1660,8 +1942,8 @@ impl XwmHandler for MoonshineCompositor {
 		// tooltips) appear on top while the primary focus remains on
 		// the main game window. Gamescope: `wlserver_notify_dropdown()`.
 		if is_focused_child && is_dropdown {
-			// Re-read metadata from map (meta was moved into insert above).
-			let meta = self.window_metadata.get(&win).unwrap();
+			// Re-read metadata from map.
+			let meta = self.window_metadata.get(&win).expect("metadata was just inserted");
 
 			// Validate the dropdown is on-screen (Task 3.1).
 			let output_size = self
@@ -1683,15 +1965,24 @@ impl XwmHandler for MoonshineCompositor {
 				return;
 			}
 
+			// Ensure notification/external-overlay classification is up to date
+			// before notify_dropdown checks for conflicts with those windows.
+			let windows: Vec<_> = self.space.elements().cloned().collect();
+			self.classify_special_windows(&windows);
+
 			// Register the dropdown with the compositor state.
 			// This checks for conflicts with notification/external overlay windows.
-			if self.notify_dropdown(win.clone(), location.x, location.y) {
-				// Give keyboard focus to the override window.
-				if let Some(keyboard) = self.seat.get_keyboard() {
-					let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-					keyboard.set_focus(self, Some(KeyboardFocusTarget::from(win.clone())), serial);
-				}
-			}
+			// Do NOT give keyboard focus to the dropdown — keyboard focus
+			// stays on the previously focused window (keyboard focus
+			// persistence). Gamescope keeps keyboard focus on the main game
+			// window while dropdowns only receive pointer events.
+			let _ = self.notify_dropdown(win.clone(), location.x, location.y);
+		} else if !is_dropdown {
+			// Non-dropdown override-redirect windows (STEAM_OVERLAY,
+			// notifications, external overlays) also need focus
+			// reevaluation so they can become overlay_window or update
+			// pointer/keyboard routing immediately.
+			self.reevaluate_focus();
 		}
 	}
 
@@ -1716,6 +2007,23 @@ impl XwmHandler for MoonshineCompositor {
 			.elements()
 			.find(|e| e.x11_surface().map(|x| x == &window).unwrap_or(false))
 			.cloned();
+
+		// Check if this window is an overlay/notification/external-overlay
+		// that might be pointed to by pointer_focus_window or the special
+		// window trackers, regardless of whether it was the focused window.
+		let is_special = maybe.as_ref().is_some_and(|elem| {
+			self.window_metadata.get(elem).is_some_and(|m| {
+				m.flags.intersects(
+					WindowFlags::OVERLAY
+						| WindowFlags::NOTIFICATION
+						| WindowFlags::EXTERNAL_OVERLAY
+						| WindowFlags::STREAMING_CLIENT
+						| WindowFlags::STREAMING_CLIENT_VIDEO
+						| WindowFlags::VR_OVERLAY_TARGET,
+				)
+			})
+		});
+
 		if let Some(elem) = maybe {
 			self.unregister_window(&elem);
 			self.space.unmap_elem(&elem);
@@ -1728,10 +2036,22 @@ impl XwmHandler for MoonshineCompositor {
 		if !window.is_override_redirect() {
 			let _ = window.set_mapped(false);
 		}
+
 		// If the focused window was unmapped, or a transient child of the
 		// focused window was unmapped, clear focus and re-evaluate.
-		if was_focused || focused_is_transient_child {
-			self.focused_x11_window = None;
+		// Also re-evaluate when focused_x11_window is None (a Wayland window
+		// had focus) to ensure Smithay keyboard focus is properly cleared.
+		// Additionally re-evaluate when a special (overlay/notification/etc.)
+		// window unmapped — pointer_focus_window and the GAMESCOPE focusable
+		// lists may be stale even if the focused window wasn't affected.
+		if was_focused || focused_is_transient_child || self.focused_x11_window.is_none() || is_special {
+			if was_focused || focused_is_transient_child {
+				self.focused_x11_window = None;
+				if let Some(keyboard) = self.seat.get_keyboard() {
+					let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+					keyboard.set_focus(self, None, serial);
+				}
+			}
 			self.reevaluate_focus();
 		}
 	}
@@ -1782,7 +2102,7 @@ impl XwmHandler for MoonshineCompositor {
 		geometry: Rectangle<i32, Logical>,
 		_above: Option<u32>,
 	) {
-		// Update position in space if the window moved.
+		// Update position in space and refresh geometry metadata.
 		let Some(elem) = self
 			.space
 			.elements()
@@ -1791,7 +2111,49 @@ impl XwmHandler for MoonshineCompositor {
 		else {
 			return;
 		};
-		self.space.map_element(elem, geometry.loc, false);
+		self.space.map_element(elem.clone(), geometry.loc, false);
+
+		// Update geometry and re-evaluate overlay-vs-notification classification
+		// for Steam windows.  A STEAM_OVERLAY window that resizes across the
+		// 1200px threshold must switch between OVERLAY and NOTIFICATION flags;
+		// stale flags cause pointer/keyboard routing to target the wrong
+		// Steam window.
+		let window_id = window.window_id();
+		let needs_reclassify = self
+			.window_metadata
+			.get(&elem)
+			.is_some_and(|m| m.flags.contains(WindowFlags::OVERLAY) || m.flags.contains(WindowFlags::NOTIFICATION));
+
+		// Read steam_overlay_value BEFORE the mutable borrow to avoid conflict.
+		let steam_overlay_value = if needs_reclassify {
+			Some(self.with_x11_focus(|xf| xf.get_steam_overlay_value(window_id)))
+		} else {
+			None
+		};
+
+		if let Some(meta) = self.window_metadata.get_mut(&elem) {
+			let old_flags = meta.flags;
+			meta.geometry = geometry;
+
+			// Only reclassify if the window has the STEAM_OVERLAY property.
+			if let Some(sov) = steam_overlay_value {
+				if sov != 0 {
+					let is_overlay = geometry.size.w > 1200;
+					if is_overlay {
+						meta.flags.remove(WindowFlags::NOTIFICATION);
+						meta.flags.insert(WindowFlags::OVERLAY);
+					} else {
+						meta.flags.remove(WindowFlags::OVERLAY);
+						meta.flags.insert(WindowFlags::NOTIFICATION);
+					}
+				}
+			}
+
+			// If classification changed, mark focus dirty so routing is updated.
+			if meta.flags != old_flags {
+				self.focus_state.mark_dirty();
+			}
+		}
 	}
 
 	fn resize_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32, _resize_edge: ResizeEdge) {
@@ -1811,61 +2173,68 @@ mod tests {
 
 	#[test]
 	fn test_steam_launch_app_id() {
-		assert_eq!(scan_cmdline_for_app_id("SteamLaunch\0AppId=12345"), 12345);
+		assert_eq!(scan_cmdline_for_app_id(b"SteamLaunch\0AppId=12345"), 12345);
 	}
 
 	#[test]
 	fn test_appids_flag() {
-		assert_eq!(scan_cmdline_for_app_id("--appids=67890"), 67890);
+		assert_eq!(scan_cmdline_for_app_id(b"--appids=67890"), 67890);
 	}
 
 	#[test]
 	fn test_appids_multiple_returns_first_nonzero() {
-		assert_eq!(scan_cmdline_for_app_id("--appids=12345,67890"), 12345);
+		assert_eq!(scan_cmdline_for_app_id(b"--appids=12345,67890"), 12345);
 	}
 
 	#[test]
 	fn test_appids_after_double_dash() {
 		// C3 fix: --appids= after -- should be detected
-		assert_eq!(scan_cmdline_for_app_id("steamwebhelper\0--\0--appids=11111"), 11111);
+		assert_eq!(scan_cmdline_for_app_id(b"steamwebhelper\0--\0--appids=11111"), 11111);
 	}
 
 	#[test]
 	fn test_steam_launch_no_app_id() {
-		assert_eq!(scan_cmdline_for_app_id("SteamLaunch"), 0);
+		assert_eq!(scan_cmdline_for_app_id(b"SteamLaunch"), 0);
 	}
 
 	#[test]
 	fn test_empty_cmdline() {
-		assert_eq!(scan_cmdline_for_app_id(""), 0);
+		assert_eq!(scan_cmdline_for_app_id(b""), 0);
 	}
 
 	#[test]
 	fn test_app_id_zero_skipped() {
-		assert_eq!(scan_cmdline_for_app_id("AppId=0"), 0);
+		assert_eq!(scan_cmdline_for_app_id(b"AppId=0"), 0);
 	}
 
 	#[test]
 	fn test_steam_launch_with_app_id_zero_skipped() {
 		// SteamLaunch followed by AppId=0 should return 0
-		assert_eq!(scan_cmdline_for_app_id("SteamLaunch\0AppId=0"), 0);
+		assert_eq!(scan_cmdline_for_app_id(b"SteamLaunch\0AppId=0"), 0);
 	}
 
 	#[test]
 	fn test_appids_with_zero_and_nonzero() {
 		// --appids=0,12345 should return 12345 (first non-zero)
-		assert_eq!(scan_cmdline_for_app_id("--appids=0,12345"), 12345);
+		assert_eq!(scan_cmdline_for_app_id(b"--appids=0,12345"), 12345);
 	}
 
 	#[test]
 	fn test_realistic_steam_cmdline() {
-		let cmdline = "/usr/bin/steamwebhelper\0--no-sandbox\0--appids=1091500";
+		let cmdline = b"/usr/bin/steamwebhelper\0--no-sandbox\0--appids=1091500";
 		assert_eq!(scan_cmdline_for_app_id(cmdline), 1091500);
 	}
 
 	#[test]
 	fn test_realistic_proton_cmdline() {
-		let cmdline = "/usr/bin/steam\0SteamLaunch\0--\0AppId=1172470\0--\0start";
+		let cmdline = b"/usr/bin/steam\0SteamLaunch\0--\0AppId=1172470\0--\0start";
 		assert_eq!(scan_cmdline_for_app_id(cmdline), 1172470);
+	}
+
+	#[test]
+	fn test_non_utf8_cmdline() {
+		// Non-UTF8 bytes should not cause a panic — the scanner works on raw bytes.
+		let cmdline = b"someproc\0\xff\xfe\0AppId=42424";
+		assert_eq!(scan_cmdline_for_app_id(cmdline), 42424);
 	}
 }

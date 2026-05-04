@@ -301,6 +301,12 @@ pub struct MoonshineCompositor {
 	/// Used by the WSI layer to match override surfaces to focused windows.
 	pub focused_x11_window: Option<u32>,
 
+	/// The actual Window that currently has keyboard focus (X11 or Wayland).
+	/// Used to properly deactivate the old window when focus changes,
+	/// especially for Wayland→Wayland transitions where focused_x11_window
+	/// would be None for both old and new.
+	pub focused_window: Option<smithay::desktop::Window>,
+
 	/// Currently active override window (dropdown, menu, tooltip).
 	/// Override windows are visually raised and may receive keyboard input
 	/// while the primary focus remains on the main game window.
@@ -576,6 +582,7 @@ impl MoonshineCompositor {
 				hdr: hdr_active,
 				override_surface: None,
 				focused_x11_window: None,
+				focused_window: None,
 				override_window: None,
 				overlay_window: None,
 				notification_window: None,
@@ -1277,10 +1284,24 @@ impl MoonshineCompositor {
 	/// when focus changes. This ensures dropdowns don't persist across focus
 	/// changes and don't interfere with the new focus window.
 	pub fn clear_dropdowns(&mut self) {
-		if self.override_window.is_some() {
+		if let Some(override_win) = self.override_window.take() {
 			self.focus_state.mark_dirty();
+			// Unmap the override window from the space so stale menus/tooltips
+			// are no longer rendered or receive input.
+			self.space.unmap_elem(&override_win);
+			// Clean up metadata and transient children index.
+			if let Some(meta) = self.window_metadata.get(&override_win) {
+				if let Some(parent_id) = meta.transient_for {
+					if let Some(children) = self.transient_children.get_mut(&parent_id) {
+						children.retain(|w| *w != override_win);
+						if children.is_empty() {
+							self.transient_children.remove(&parent_id);
+						}
+					}
+				}
+			}
+			self.window_metadata.remove(&override_win);
 		}
-		self.override_window = None;
 		tracing::debug!(target: "focus", "Cleared dropdown/override windows");
 	}
 
@@ -1317,6 +1338,33 @@ impl MoonshineCompositor {
 
 		self.override_window = Some(window.clone());
 		self.focus_state.mark_dirty();
+
+		// Send a synthetic pointer motion to establish pointer focus on the
+		// dropdown so that subsequent MouseButtonDown/Up are delivered there
+		// instead of the previously focused surface.
+		if let Some(x11) = window.x11_surface() {
+			if let Some(wl_surface) = x11.wl_surface() {
+				let window_loc = Point::from((x as f64, y as f64));
+				let pointer = self.seat.get_pointer().expect("pointer should exist");
+				let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+				tracing::debug!(
+					target: "focus",
+					surface_id = ?wl_surface,
+					"notify_dropdown: sending initial pointer motion event to dropdown"
+				);
+				pointer.motion(
+					self,
+					Some((wl_surface.clone(), window_loc)),
+					&smithay::input::pointer::MotionEvent {
+						location: self.cursor_position,
+						serial,
+						time: self.clock.now().as_millis(),
+					},
+				);
+				pointer.frame(self);
+			}
+		}
+
 		tracing::debug!(
 			target: "focus",
 			window_id = window.x11_surface().map(|x| x.window_id()),

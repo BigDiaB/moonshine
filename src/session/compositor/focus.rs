@@ -194,7 +194,7 @@ impl WindowMetadata {
 	}
 
 	/// Returns `true` if this is a Steam Big Picture window.
-	/// Gamescope: detects STEAM_LEGACY_BIG_PROPERTY property.
+	/// Gamescope: detects STEAM_LEGACY_BIG_PICTURE property.
 	pub fn is_steam_big_picture(&self) -> bool {
 		self.app_id == 769
 	}
@@ -303,10 +303,21 @@ impl FocusState {
 		self.mark_dirty();
 	}
 
-	/// Consume and return the pending `_NET_ACTIVE_WINDOW` focus request, if any.
+	// /// Consume and return the pending `_NET_ACTIVE_WINDOW` focus request, if any.
+	// /// Returns `None` if no explicit request is pending.
+	// pub fn take_requested_focus(&mut self) -> Option<u32> {
+	// 	self.requested_focus_window.take()
+	// }
+
+	/// Peek at the pending `_NET_ACTIVE_WINDOW` focus request without consuming it.
 	/// Returns `None` if no explicit request is pending.
-	pub fn take_requested_focus(&mut self) -> Option<u32> {
-		self.requested_focus_window.take()
+	pub fn peek_requested_focus(&self) -> Option<u32> {
+		self.requested_focus_window
+	}
+
+	/// Clear the pending `_NET_ACTIVE_WINDOW` focus request.
+	pub fn clear_requested_focus(&mut self) {
+		self.requested_focus_window = None;
 	}
 }
 
