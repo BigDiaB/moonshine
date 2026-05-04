@@ -146,7 +146,7 @@ pub struct ApplicationConfig {
 
 	/// Commands to run after the streaming session ends.
 	/// Each inner Vec is a separate command; they execute in order.
-	/// Runs in the background — moonshine does not wait for them to finish.
+	/// Runs synchronously — the server waits for all to finish before accepting new connections.
 	/// Useful for restoring system state (e.g. GPU power management).
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub post_command: Vec<Vec<String>>,
