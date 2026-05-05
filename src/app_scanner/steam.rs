@@ -129,7 +129,7 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 					if boxart.exists() {
 						application.boxart = Some(boxart);
 					} else {
-						tracing::warn!("No boxart for game '{}' at '{}.", application.title, boxart.display());
+						tracing::warn!("No boxart for game '{}' at '{}'.", application.title, boxart.display());
 					}
 				} else {
 					tracing::debug!(
