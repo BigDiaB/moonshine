@@ -97,7 +97,11 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 			let folder_path = folder.path.clone();
 
 			folder.apps.into_iter().filter_map(move |app_id| {
-				let mut application = ApplicationConfig { ..Default::default() };
+				let mut application = ApplicationConfig {
+					pre_command: config.pre_command.clone(),
+					post_command: config.post_command.clone(),
+					..Default::default()
+				};
 
 				let steamapps_dir = folder_path.join("steamapps");
 				if let Ok(title) = get_game_name(app_id, &steamapps_dir) {

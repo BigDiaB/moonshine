@@ -106,6 +106,23 @@ command = ["/usr/bin/steam", "steam://open/bigpicture"]
 - `title`: The name shown in Moonlight.
 - `boxart` (optional): Path to a cover image.
 - `command`: The command to run. First entry is the executable, the rest are arguments.
+- `pre_command` (optional): Commands to run before launching the application. Each entry is a separate command, executed in order. Runs synchronously — the session waits for all to finish.
+- `post_command` (optional): Commands to run after the streaming session ends. Each entry is a separate command, executed in order. Runs synchronously — the server waits for all to finish.
+
+Example:
+
+```toml
+[[application]]
+title = "Steam"
+command = ["/usr/bin/steam", "steam://open/bigpicture"]
+pre_command = [
+    ["/usr/bin/systemctl", "stop", "conflicting.service"],
+    ["/usr/bin/nvidia-smi", "pstate", "50"],
+]
+post_command = [
+    ["/usr/bin/nvidia-smi", "pstate", "performance"],
+]
+```
 
 ### Application scanners
 
