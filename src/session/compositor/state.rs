@@ -594,14 +594,24 @@ impl MoonshineCompositor {
 		// the override's wl_surface (the gamescope_swapchain image) and
 		// deliver frame callbacks to it. Otherwise scanout from the lone
 		// space toplevel as before.
-		if self.is_override_active() {
-			if self.try_direct_scanout_override() {
-				tracing::trace!("Frame via direct scanout (override path)");
+		//
+		// Direct scanout bypasses the GLES compositor entirely, so the
+		// cursor cannot be blended onto the frame.  Skip direct scanout
+		// when the cursor is visible so that the GLES path composites the
+		// cursor on top.
+		let cursor_visible = self
+			.last_pointer_activity
+			.is_some_and(|t| t.elapsed() <= std::time::Duration::from_secs(3));
+		if !cursor_visible {
+			if self.is_override_active() {
+				if self.try_direct_scanout_override() {
+					tracing::trace!("Frame via direct scanout (override path)");
+					return;
+				}
+			} else if self.try_direct_scanout() {
+				tracing::trace!("Frame via direct scanout (not override path)");
 				return;
 			}
-		} else if self.try_direct_scanout() {
-			tracing::trace!("Frame via direct scanout (not override path)");
-			return;
 		}
 
 		// Pick the next buffer from the pre-allocated pool.
