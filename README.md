@@ -59,9 +59,12 @@ sudo pacman -S \
    cmake \
    gcc-libs \
    glibc \
+   libc++ \
    libevdev \
    libpulse \
+   libxkbcommon \
    make \
+   mesa \
    opus \
    pkg-config \
    rust \
