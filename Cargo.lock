@@ -2338,6 +2338,7 @@ dependencies = [
  "aes-gcm",
  "ash",
  "async-shutdown",
+ "bitflags",
  "byteorder",
  "bytes",
  "calloop",
@@ -3246,7 +3247,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3520,8 +3521,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "740cea6927892bc182d5bf70c8f79806c8bc9f68f2fb96e55a30be171b63af98"
+source = "git+https://github.com/hgaiser/smithay?tag=v0.7.0-moonshine#409c6a0579386208b30afbd233becfee085d9625"
 dependencies = [
  "appendlist",
  "atomic_float",
@@ -4449,15 +4449,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]
