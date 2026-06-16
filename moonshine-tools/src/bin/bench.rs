@@ -240,7 +240,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		CompositorConfig::default(),
 		VideoStreamConfig::default(),
 		AudioStreamConfig { port: 0 },
-		ControlStreamConfig { port: 0 },
+		ControlStreamConfig {
+			port: 0,
+			..Default::default()
+		},
 		"127.0.0.1".to_string(),
 		60,
 		shutdown.clone(),
@@ -386,7 +389,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 				break;
 			},
 			_ = tokio::time::sleep(duration_remaining) => {
-				if duration_remaining.as_secs() > 0 {
+				if duration_deadline.is_some_and(|d| Instant::now() >= d) {
 					tracing::info!("Duration reached, stopping...");
 					break;
 				}

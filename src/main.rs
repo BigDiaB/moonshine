@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use async_shutdown::ShutdownManager;
@@ -9,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 use moonshine_core::clients::ClientManager;
 use moonshine_core::config::Config;
-use moonshine_core::discovery::ZeroconfDiscovery;
+use moonshine_core::discovery::MdnsDiscovery;
 use moonshine_core::rtsp::RtspServer;
 use moonshine_core::session::manager::SessionManager;
 use moonshine_core::webserver::Webserver;
@@ -27,7 +28,9 @@ async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
 	tracing_subscriber::registry()
-		.with(tracing_subscriber::fmt::layer())
+		// Only color when stdout is a terminal: under systemd the escape codes
+		// make journald store every MESSAGE as a byte array instead of a string.
+		.with(tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal()))
 		.with(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("error")))
 		.init();
 
@@ -72,7 +75,7 @@ pub struct Moonshine {
 	_session_manager: SessionManager,
 	_client_manager: ClientManager,
 	_webserver: Webserver,
-	_discovery: ZeroconfDiscovery,
+	_discovery: MdnsDiscovery,
 }
 
 impl Moonshine {
@@ -105,6 +108,7 @@ impl Moonshine {
 			_client_manager: client_manager.clone(),
 			_webserver: Webserver::new(
 				config.name.clone(),
+				config.address.clone(),
 				config.stream.port,
 				config.webserver.clone(),
 				config.applications.clone(),
@@ -115,7 +119,7 @@ impl Moonshine {
 				session_manager,
 				shutdown.clone(),
 			)?,
-			_discovery: ZeroconfDiscovery::spawn(config.webserver.port, config.name, shutdown),
+			_discovery: MdnsDiscovery::spawn(&config.address, config.webserver.port, &config.name),
 		})
 	}
 }

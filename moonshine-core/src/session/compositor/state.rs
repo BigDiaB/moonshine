@@ -158,10 +158,11 @@ impl RenderElement<GlesRenderer> for OutputRenderElements {
 		dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
 		damage: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
 		opaque_regions: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+		cache: Option<&smithay::utils::user_data::UserDataMap>,
 	) -> Result<(), GlesError> {
 		match self {
-			Self::Space(e) => e.draw(frame, src, dst, damage, opaque_regions),
-			Self::Pointer(e) => e.draw(frame, src, dst, damage, opaque_regions),
+			Self::Space(e) => e.draw(frame, src, dst, damage, opaque_regions, cache),
+			Self::Pointer(e) => e.draw(frame, src, dst, damage, opaque_regions, cache),
 		}
 	}
 
@@ -390,6 +391,11 @@ pub(crate) struct MoonshineCompositor {
 		std::collections::HashMap<smithay::reexports::wayland_server::backend::ObjectId, usize>,
 	/// Next available scanout buffer index.
 	scanout_next_index: usize,
+	/// Last logged direct-scanout buffer parameters (fourcc, modifier,
+	/// num_planes, width, height). NVIDIA's Wayland WSI wraps a new
+	/// `wl_buffer` (and thus a new buffer index) every frame, so imports are
+	/// only logged when these parameters change rather than per buffer.
+	last_scanout_buffer_desc: Option<(u32, u64, usize, u32, u32)>,
 }
 
 /// Client state required by Smithay's compositor.
@@ -620,6 +626,7 @@ impl MoonshineCompositor {
 				held_scanout_buffers: Vec::new(),
 				scanout_buffer_map: std::collections::HashMap::new(),
 				scanout_next_index: BUFFER_POOL_SIZE,
+				last_scanout_buffer_desc: None,
 			},
 			display,
 		)
@@ -1161,17 +1168,31 @@ impl MoonshineCompositor {
 		let buffer_index = *self.scanout_buffer_map.entry(buffer_id.clone()).or_insert_with(|| {
 			let idx = self.scanout_next_index;
 			self.scanout_next_index += 1;
+			idx
+		});
+
+		// Log buffer parameters only when they change — logging every new
+		// buffer index would spam at frame rate on NVIDIA (see
+		// `last_scanout_buffer_desc`).
+		let buffer_desc = (
+			client_dmabuf.format().code as u32,
+			Into::<u64>::into(client_dmabuf.format().modifier),
+			client_dmabuf.num_planes(),
+			client_dmabuf.width(),
+			client_dmabuf.height(),
+		);
+		if self.last_scanout_buffer_desc != Some(buffer_desc) {
 			tracing::debug!(
-				buffer_index = self.scanout_next_index - 1,
+				buffer_index,
 				fourcc = ?client_dmabuf.format().code,
 				modifier = format!("{:#x}", Into::<u64>::into(client_dmabuf.format().modifier)).as_str(),
 				num_planes = client_dmabuf.num_planes(),
 				width = client_dmabuf.width(),
 				height = client_dmabuf.height(),
-				"Override scanout: importing new buffer",
+				"Override scanout: buffer parameters changed",
 			);
-			idx
-		});
+			self.last_scanout_buffer_desc = Some(buffer_desc);
+		}
 
 		let consumed = Arc::new(AtomicBool::new(false));
 
@@ -1463,8 +1484,13 @@ impl MoonshineCompositor {
 					// Set the client compositor scale to 1.0 (no HiDPI scaling for XWayland).
 					data.client_compositor_state(&client).set_client_scale(1.0);
 
-					let wm = smithay::xwayland::X11Wm::start_wm(data.handle.clone(), x11_socket, client.clone())
-						.expect("Failed to start X11 window manager.");
+					let wm = smithay::xwayland::X11Wm::start_wm(
+						data.handle.clone(),
+						&data.display_handle,
+						x11_socket,
+						client.clone(),
+					)
+					.expect("Failed to start X11 window manager.");
 
 					tracing::debug!(display_number, "XWayland ready.");
 

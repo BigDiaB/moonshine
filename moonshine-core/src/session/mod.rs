@@ -14,6 +14,7 @@ use crate::session::stream::control::ControlStreamContext;
 use crate::session::stream::video::FrameStats;
 use crate::session::stream::video::VideoStream;
 use crate::session::stream::video::VideoStreamContext;
+use crate::session::stream::video::VideoStreamHandle;
 
 use self::application::Application;
 use self::application::ApplicationConfig;
@@ -133,6 +134,7 @@ pub(crate) struct InitializedSession {
 	video_stream: VideoStream,
 	control_stream: ControlStream,
 	hdr_metadata_rx: watch::Receiver<HdrModeState>,
+	stop: ShutdownManager<SessionShutdownReason>,
 }
 
 impl InitializedSession {
@@ -171,6 +173,7 @@ impl InitializedSession {
 			video_stream,
 			control_stream,
 			hdr_metadata_rx,
+			stop,
 		})
 	}
 
@@ -187,6 +190,7 @@ impl InitializedSession {
 			video_stream,
 			control_stream,
 			hdr_metadata_rx,
+			stop,
 		} = self;
 
 		let launched_compositor = compositor.launch()?;
@@ -211,6 +215,7 @@ impl InitializedSession {
 					),
 				]),
 			},
+			stop,
 		)
 		.await?;
 
@@ -283,6 +288,10 @@ impl LaunchedSession {
 		let video_start_notify = video_handle.clone_start_notify();
 		let audio_start_notify = audio_trigger.clone_start_notify();
 
+		// Keep a handle to the video stream so a resuming client can reset its
+		// frame counters (see `ActiveSession::reset_video_stream`).
+		let video_handle_for_resume = video_handle.clone();
+
 		// Start control stream — receives both handles.
 		let control_ctx = ControlStreamContext::new(&context, hdr_effective);
 		control_stream.start(
@@ -297,6 +306,7 @@ impl LaunchedSession {
 			ActiveSession {
 				context,
 				_application: application,
+				video_handle: video_handle_for_resume,
 			},
 			video_start_notify,
 			audio_start_notify,
@@ -308,10 +318,16 @@ impl LaunchedSession {
 pub(crate) struct ActiveSession {
 	context: SessionContext,
 	_application: Application,
+	video_handle: VideoStreamHandle,
 }
 
 impl ActiveSession {
 	pub(crate) fn context(&self) -> &SessionContext {
 		&self.context
+	}
+
+	/// Reset the video stream's frame counters and force an IDR for a resuming client.
+	pub(crate) fn reset_video_stream(&self) {
+		self.video_handle.request_reset();
 	}
 }

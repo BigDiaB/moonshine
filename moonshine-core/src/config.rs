@@ -5,6 +5,7 @@ pub use crate::app_scanner::steam::SteamApplicationScannerConfig;
 pub use crate::app_scanner::ApplicationScannerConfig;
 pub use crate::session::application::ApplicationConfig;
 use crate::session::compositor::CompositorConfig;
+pub use crate::session::stream::control::input::gamepad::GamepadConfig;
 use crate::session::stream::StreamConfig;
 use crate::webserver::WebserverConfig;
 
@@ -15,6 +16,8 @@ pub struct Config {
 	pub name: String,
 
 	/// Address to bind to.
+	///
+	/// Use IPv4 (eg. `0.0.0.0`) for IPv4-only, or IPv6 (eg. `::`) for dual-stack (IPv4 + IPv6).
 	pub address: String,
 
 	/// Configuration for the webserver.
@@ -92,6 +95,8 @@ impl Default for Config {
 	fn default() -> Self {
 		Self {
 			name: "Moonshine".to_string(),
+			// IPv4-only by default; set to `::` to bind dual-stack (the webserver
+			// disables IPV6_V6ONLY, so that single address covers both).
 			address: "0.0.0.0".to_string(),
 			webserver: Default::default(),
 			stream: Default::default(),

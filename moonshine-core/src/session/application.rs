@@ -4,8 +4,10 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use async_shutdown::ShutdownManager;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 use zbus::proxy::SignalStream;
 use zbus::{Connection, MatchRule, MessageStream, Proxy};
 use zvariant::OwnedObjectPath;
@@ -34,13 +36,13 @@ pub struct ApplicationConfig {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub post_command: Vec<Vec<String>>,
 
-	/// Path to redirect application stdout to. If not set, stdout is discarded.
+	/// systemd StandardOutput value. If not set, defaults to "null".
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub stdout: Option<PathBuf>,
+	pub stdout: Option<String>,
 
-	/// Path to redirect application stderr to. If not set, stderr is discarded.
+	/// systemd StandardError value. If not set, defaults to "null".
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub stderr: Option<PathBuf>,
+	pub stderr: Option<String>,
 
 	/// Seconds to wait for the application to reach an active state after launch.
 	#[serde(default = "default_launch_timeout")]
@@ -70,6 +72,8 @@ impl ApplicationConfig {
 	}
 }
 
+use crate::session::manager::SessionShutdownReason;
+
 const SYSTEMD_BUS: &str = "org.freedesktop.systemd1";
 const SYSTEMD_PATH: &str = "/org/freedesktop/systemd1";
 const SYSTEMD_MANAGER: &str = "org.freedesktop.systemd1.Manager";
@@ -91,8 +95,8 @@ pub(crate) struct LaunchOptions<'a> {
 	pub timeout: Duration,
 	pub pre_commands: &'a Vec<Vec<String>>,
 	pub post_commands: &'a Vec<Vec<String>>,
-	pub stdout_path: &'a Option<PathBuf>,
-	pub stderr_path: &'a Option<PathBuf>,
+	pub stdout_value: &'a Option<String>,
+	pub stderr_value: &'a Option<String>,
 }
 
 /// Runtime context required to launch an application.
@@ -114,10 +118,15 @@ pub(crate) struct ApplicationContext {
 pub(crate) struct Application {
 	unit_name: String,
 	config: ApplicationConfig,
+	exit_monitor: Option<JoinHandle<()>>,
 }
 
 impl Application {
-	pub async fn spawn(config: ApplicationConfig, context: ApplicationContext) -> Result<Self, ()> {
+	pub async fn spawn(
+		config: ApplicationConfig,
+		context: ApplicationContext,
+		stop: ShutdownManager<SessionShutdownReason>,
+	) -> Result<Self, ()> {
 		let Some(program) = config.command.first() else {
 			tracing::error!("Application command is empty.");
 			return Err(());
@@ -144,22 +153,24 @@ impl Application {
 			timeout: Duration::from_secs(config.launch_timeout_secs),
 			pre_commands: &config.pre_command,
 			post_commands: &config.post_command,
-			stdout_path: &config.stdout,
-			stderr_path: &config.stderr,
+			stdout_value: &config.stdout,
+			stderr_value: &config.stderr,
 		};
 
-		match start_transient_service(&conn, &options).await {
-			Ok(()) => {},
+		let unit_path = match start_transient_service(&conn, &options).await {
+			Ok(unit_path) => unit_path,
 			Err(_) => {
 				// Best effort cleanup on launch failure.
 				stop_unit(&conn, &context.unit_name).await.ok();
 				return Err(());
 			},
 		};
+		let exit_monitor = spawn_unit_exit_monitor(conn.clone(), context.unit_name.clone(), unit_path, stop);
 
 		Ok(Self {
 			unit_name: context.unit_name,
 			config,
+			exit_monitor: Some(exit_monitor),
 		})
 	}
 }
@@ -167,6 +178,9 @@ impl Application {
 impl Drop for Application {
 	fn drop(&mut self) {
 		tracing::info!("Application '{}' is exiting.", self.config.title);
+		if let Some(handle) = self.exit_monitor.take() {
+			handle.abort();
+		}
 
 		// Unfortunately we have no `drop_async` yet, so we must spawn an async runtime to call stop_unit.
 		let unit_name = self.unit_name.clone();
@@ -348,8 +362,134 @@ async fn stop_unit_owned(unit_name: String) -> Result<(), ()> {
 	stop_unit(&conn, &unit_name).await
 }
 
+fn spawn_unit_exit_monitor(
+	conn: Connection,
+	unit_name: String,
+	unit_path: OwnedObjectPath,
+	stop: ShutdownManager<SessionShutdownReason>,
+) -> JoinHandle<()> {
+	tokio::spawn(async move {
+		tokio::select! {
+			state = wait_for_unit_terminal_state(&conn, &unit_name, &unit_path) => {
+				match state {
+					Ok(state) => {
+						tracing::info!(unit = unit_name, state, "Application unit exited; stopping session.");
+						let _ = stop.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
+					},
+					Err(()) => {
+						tracing::warn!(unit = unit_name, "Application unit monitor stopped unexpectedly.");
+					},
+				}
+			},
+			_ = stop.wait_shutdown_triggered() => {},
+		}
+	})
+}
+
+async fn wait_for_unit_terminal_state(
+	conn: &Connection,
+	unit_name: &str,
+	unit_path: &OwnedObjectPath,
+) -> Result<String, ()> {
+	let proxy = Proxy::new(conn, SYSTEMD_BUS, SYSTEMD_PATH, SYSTEMD_MANAGER)
+		.await
+		.map_err(|e| tracing::error!("Failed to create systemd proxy: {e}"))?;
+	let mut unit_removed_stream = proxy
+		.receive_signal("UnitRemoved")
+		.await
+		.map_err(|e| tracing::error!("Failed to subscribe to UnitRemoved signals: {e}"))?;
+
+	let rule = MatchRule::builder()
+		.msg_type(zbus::message::Type::Signal)
+		.sender(SYSTEMD_BUS)
+		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
+		.path(unit_path)
+		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
+		.interface(PROPERTIES_INTERFACE)
+		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
+		.member(PROPERTIES_CHANGED)
+		.map_err(|e| tracing::error!("Failed to create match rule: {e}"))?
+		.build();
+	let mut state_stream = MessageStream::for_match_rule(rule, conn, None)
+		.await
+		.map_err(|e| tracing::error!("Failed to create state stream: {e}"))?;
+
+	match current_unit_state(conn, unit_path).await {
+		Ok(state) => {
+			if let Some(state) = terminal_state(state.as_str()) {
+				return Ok(state.to_string());
+			}
+		},
+		Err(()) => return Ok("removed".to_string()),
+	}
+
+	loop {
+		tokio::select! {
+			message = state_stream.next() => {
+				let Some(Ok(signal)) = message else {
+					return Err(());
+				};
+				let body = signal.body();
+				let (iface, changed, _): (String, HashMap<String, zvariant::Value<'_>>, Vec<String>) =
+					body.deserialize()
+						.map_err(|e| tracing::error!("Failed to deserialize PropertiesChanged signal: {e}"))?;
+				if iface != UNIT_INTERFACE {
+					continue;
+				}
+				if let Some(zvariant::Value::Str(state)) = changed.get(ACTIVE_STATE_PROPERTY) {
+					if let Some(state) = terminal_state(state.as_str()) {
+						return Ok(state.to_string());
+					}
+				}
+			},
+			message = unit_removed_stream.next() => {
+				let Some(message) = message else {
+					return Err(());
+				};
+				let (id, _path): (String, OwnedObjectPath) = message
+					.body()
+					.deserialize()
+					.map_err(|e| tracing::error!("Failed to deserialize UnitRemoved signal: {e}"))?;
+				if id == unit_name {
+					return Ok("removed".to_string());
+				}
+			},
+		}
+	}
+}
+
+async fn current_unit_state(conn: &Connection, unit_path: &OwnedObjectPath) -> Result<String, ()> {
+	let reply = conn
+		.call_method(
+			Some(SYSTEMD_BUS),
+			unit_path,
+			Some(PROPERTIES_INTERFACE),
+			"Get",
+			&(UNIT_INTERFACE, ACTIVE_STATE_PROPERTY),
+		)
+		.await
+		.map_err(|e| tracing::error!("Failed to get unit state: {e}"))?;
+
+	let body = reply.body();
+	let (variant,): (zvariant::Value<'_>,) = body.deserialize().map_err(|e| {
+		tracing::error!("Failed to deserialize unit state: {e}");
+	})?;
+	match variant {
+		zvariant::Value::Str(state) => Ok(state.to_string()),
+		_ => Ok("unknown".to_string()),
+	}
+}
+
+fn terminal_state(state: &str) -> Option<&'static str> {
+	match state {
+		"inactive" => Some("inactive"),
+		"failed" => Some("failed"),
+		_ => None,
+	}
+}
+
 /// Launch the application as a transient systemd service unit via D-Bus.
-async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>) -> Result<(), ()> {
+async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>) -> Result<OwnedObjectPath, ()> {
 	// Resolve exec entries in a blocking task — `which::which` does filesystem lookups.
 	let (pre_entries, main_entry, post_entries) = tokio::task::spawn_blocking({
 		let pre_commands = options.pre_commands.clone();
@@ -386,27 +526,16 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 		("ExecStart", build_exec_array(&[main_entry])?),
 		("TimeoutStopUSec", zvariant::Value::U64(5_000_000)),
 		("CollectMode", zvariant::Value::Str("inactive-or-failed".into())),
+		// StandardOutput/StandardError: systemd expects `s` (string)
+		// Valid values: inherit, null, tty, journal, kmsg, journal+console,
+		// file:path, append:path, truncate:path, socket, fd:name
 		(
 			"StandardOutput",
-			zvariant::Value::Str(
-				options
-					.stdout_path
-					.as_ref()
-					.map(|p| format!("append:{}", p.display()))
-					.unwrap_or_else(|| "null".to_string())
-					.into(),
-			),
+			zvariant::Value::Str(options.stdout_value.as_deref().unwrap_or("null").into()),
 		),
 		(
 			"StandardError",
-			zvariant::Value::Str(
-				options
-					.stderr_path
-					.as_ref()
-					.map(|p| format!("append:{}", p.display()))
-					.unwrap_or_else(|| "null".to_string())
-					.into(),
-			),
+			zvariant::Value::Str(options.stderr_value.as_deref().unwrap_or("null").into()),
 		),
 	];
 
@@ -468,26 +597,8 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 		.map_err(|e| tracing::error!("Failed to deserialize unit object path: {e}"))?;
 
 	// Check current state before subscribing — catches apps that exit immediately.
-	let reply = conn
-		.call_method(
-			Some(SYSTEMD_BUS),
-			&path,
-			Some(PROPERTIES_INTERFACE),
-			"Get",
-			&(UNIT_INTERFACE, ACTIVE_STATE_PROPERTY),
-		)
-		.await
-		.map_err(|e| tracing::error!("Failed to get unit state: {e}"))?;
-
-	let body = reply.body();
-	let (variant,): (zvariant::Value<'_>,) = body.deserialize().map_err(|e| {
-		tracing::error!("Failed to deserialize unit state: {e}");
-	})?;
-	let state = match variant {
-		zvariant::Value::Str(s) => s.to_string(),
-		_ => "unknown".to_string(),
-	};
-	if state == "failed" || state == "inactive" {
+	let state = current_unit_state(conn, &path).await?;
+	if terminal_state(&state).is_some() {
 		tracing::warn!(state = state, "Application exited immediately after launch.");
 		return Err(());
 	}
@@ -536,13 +647,13 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 		Ok(Ok(())) => {
 			// Timeout expired — unit is still alive, launch succeeded.
 			tracing::info!("Application launched in service {}", options.unit_name);
-			Ok(())
+			Ok(path)
 		},
 		Ok(Err(())) => Err(()),
 		Err(_) => {
 			// Timeout expired — unit is still alive, launch succeeded.
 			tracing::info!("Application launched in service {}", options.unit_name);
-			Ok(())
+			Ok(path)
 		},
 	}
 }
